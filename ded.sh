@@ -26,18 +26,21 @@
 # parted, resize2fs, fatresize, ntfsresize, mke2fs, mkdosfs, mkntfs
 set -e
 
-onerr() {
-	[ $? -eq 0 ] && exit
-	echo "Unknown failure occurred!"
-}
-
-trap 'onerr' EXIT
-
 NORMAL_PRECISION="4"
 # max that doesn't cause errors comparing large numbers
 MAX_PRECISION="18"
 
-trap 'exit 1' TERM
+onerr() {
+	code=$?
+	if [ ${code} -ne 0 ]; then
+		if [ $code -ne 15 ]; then
+			echo "Unknown failure occurred!"
+		fi
+	fi
+}
+
+trap 'onerr' EXIT
+trap 'exit 15' TERM
 
 fail() {
 	echo "${1}" >&2
