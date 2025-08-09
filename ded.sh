@@ -362,24 +362,24 @@ create_cmd() {
 	default_name="Unnamed partition"
 	case "${target_type}" in
 		"ext4")
-			default_name="Linux data"
+			default_name="Linux filesystem data"
 			assert_exists "mke2fs"
 			;;
 		"fat32")
-			default_name="Basic data"
+			default_name="Basic data partition"
 			assert_exists "mkdosfs"
 			;;
 		"efi")
-			default_name="EFI System"
+			default_name="EFI System partition"
 			fs_type="fat32"
 			assert_exists "mkdosfs"
 			;;
 		"ntfs")
-			default_name="Basic data"
+			default_name="Basic data partition"
 			assert_exists "mkntfs"
 			;;
 		"swap")
-			default_name="Swap"
+			default_name="Swap partition"
 			fs_type="linux-swap(v1)"
 			assert_exists "mkswap"
 			;;
