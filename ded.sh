@@ -95,6 +95,23 @@ parse_diskline() {
 	p_flags="$8"
 }
 
+# if comma separated list contains item
+contains() {
+	OIFS="${IFS}"
+	list="${1}"
+	item="${2}"
+	IFS="${3:-, }"
+	# shellcheck disable=SC2086
+	for v in ${list}; do
+		if [ "${v}" = "${item}" ]; then
+			IFS="${OIFS}"
+			return 0
+		fi
+	done
+	IFS="${OIFS}"
+	return 1
+}
+
 parse_partline() {
 	# 1:1048576B:1074790399B:1073741824B:fat32::msftdata;
 	OIFS="${IFS}"
@@ -107,22 +124,26 @@ parse_partline() {
 	p_end="${3%B}"
 	p_size="${4%B}"
 	p_fs="$5"
-	p_type="$5"
+	p_name="$6"
+	p_flags="${7:-}"
+
+	# "type" is a simplified abstraction over fs type and flags
+	# ideally a GPT guid, but parted flags are less concrete
+	p_type="${p_fs}"
 	# simplify linux-swap(new,v1,v0,old) etc situation
 	case "${p_type}" in
 		*swap*)
 			p_type="swap"
 			;;
 	esac
-	p_name="$6"
-	p_flags="${7:-}"
-
-	if [ "${p_type}" = "fat32" ]; then
-		case "${p_flags}" in
-			*esp*)
-				p_type="efi"
-				;;
-		esac
+	if contains "${p_flags}" "esp"; then
+		p_type="efi"
+	fi
+	if contains "${p_flags}" "msftres"; then
+		p_type="msres"
+	fi
+	if contains "${p_flags}" "diag"; then
+		p_type="msdiag"
 	fi
 }
 
