@@ -437,7 +437,7 @@ create_cmd() {
 
 	case "${target_type}" in
 		"ext4")
-			yes | mke2fs -q -t ext4 -L "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
+			yes 2>/dev/null | mke2fs -q -t ext4 -L "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
 		"fat32")
 			mkdosfs -n "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
 		"efi")
@@ -482,7 +482,7 @@ resize_fs() {
 		"ntfs")
 			assert_exists "ntfsresize"
 			# units are in SI 1000, avoid them and use bytes
-			ntfsresize -f -s "${size}" "${partdevice}" || fail "Failed to resize ntfs!"
+			yes 2>/dev/null | ntfsresize -f -s "${size}" "${partdevice}" || fail "Failed to resize ntfs!"
 			;;
 		*)
 			fail "Unsupported TYPE!" ;;
@@ -537,7 +537,7 @@ resize_cmd() {
 		# parted -s doesn't work for shrinking partitions "to be safe"
 		# use undocumented option "---pretend-input-tty" to work around with "yes"
 		# could also work around by removing and re-creating?
-		yes | sudo parted ---pretend-input-tty "${device}" unit B resizepart "${target_num}" "${target_end}" || fail "Failed to resize partition! (You might need to patch parted)"
+		yes 2>/dev/null | parted ---pretend-input-tty "${device}" unit B resizepart "${target_num}" "${target_end}" || fail "Failed to resize partition!"
 		print_device "${device}"
 	else
 		fail "Partition ${target_num} is already that size!"
