@@ -24,6 +24,10 @@ onerr() {
 	echo "Failure occurred!"
 }
 
+ded() {
+	sudo ./ded.sh "$@"
+}
+
 trap 'onerr' EXIT
 
 make_disk() {
@@ -31,73 +35,73 @@ make_disk() {
 	dd if=/dev/zero bs=1MiB count=1024 of="test.disk"
 	parted -s test.disk mktable gpt
 	parted test.disk unit B print free
-	sudo losetup -d /dev/loop0
+	sudo losetup -d /dev/loop0 || true
 	sudo losetup /dev/loop0 test.disk
 	sudo parted /dev/loop0 unit B print free
 }
 
 test_argparsing() {
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create -1 fat32
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create fat32
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create fat32 "foo bar"
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create fat32 "foo bar" 8MiB
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create fat32 "" 8MiB
+	ded -y wipe loop0
+	ded -y create loop0 -1 fat
+	ded -y wipe loop0
+	ded -y create loop0 fat
+	ded -y wipe loop0
+	ded -y create loop0 fat "foo bar"
+	ded -y wipe loop0
+	ded -y create loop0 fat "foo bar" 8MiB
+	ded -y wipe loop0
+	ded -y create loop0 fat "" 8MiB
 }
 
 test_fs() {
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create efi   8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create ext4  8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create ntfs  8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create fat32 8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create swap
+	ded -y wipe loop0
+	ded -y create loop0 efi   8 MiB
+	ded -y create loop0 ext4  8 MiB
+	ded -y create loop0 ntfs  8 MiB
+	ded -y create loop0 fat32 8 MiB
+	ded -y create loop0 swap
 }
 
 test_holes() {
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create fat32 8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create fat32 8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create ext4  8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create fat32 8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create fat32 8 MiB
-	yes | sudo ./ded.sh /dev/loop0 create fat32 8 MiB
-	yes | sudo ./ded.sh /dev/loop0 remove 2
-	yes | sudo ./ded.sh /dev/loop0 remove 5
+	ded -y wipe loop0
+	ded -y create loop0 fat32 8 MiB
+	ded -y create loop0 fat32 8 MiB
+	ded -y create loop0 ext4  8 MiB
+	ded -y create loop0 fat32 8 MiB
+	ded -y create loop0 fat32 8 MiB
+	ded -y create loop0 fat32 8 MiB
+	ded -y remove loop0 2
+	ded -y remove loop0 5
 	# add some strange flags to test recreating them
-	sudo parted /dev/loop0 set 3 hidden on
-	sudo parted /dev/loop0 set 3 hp-service on
-	yes | sudo ./ded.sh /dev/loop0 lshift 3
+	sudo parted loop0 set 3 hidden on
+	sudo parted loop0 set 3 hp-service on
+	ded-y lshift loop0 3
 	# new partition is 2
-	yes | sudo ./ded.sh /dev/loop0 resize 2
+	ded -y resize loop0 2
 }
 
 test_resize() {
 	# experimentally ~260MiB is the smallest fatresize/libparted wants to work with
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create fat32 300 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1 500 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1 350 MiB
+	ded -y wipe loop0
+	ded -y create loop0 fat32 300 MiB
+	ded -y resize loop0 1 500 MiB
+	ded -y resize loop0 1 350 MiB
 
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create efi 300 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1 500 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1 350 MiB
+	ded -y wipe loop0
+	ded -y create loop0 efi 300 MiB
+	ded -y resize loop0 1 500 MiB
+	ded -y resize loop0 1 350 MiB
 
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create ext4 100 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1 500 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1 50 MiB
+	ded -y wipe loop0
+	ded -y create loop0 ext4 100 MiB
+	ded -y resize loop0 1 500 MiB
+	ded -y resize loop0 1 50 MiB
 
-	yes | sudo ./ded.sh /dev/loop0 wipe
-	yes | sudo ./ded.sh /dev/loop0 create ntfs 100 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1 500 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1 50 MiB
-	yes | sudo ./ded.sh /dev/loop0 resize 1
+	ded -y wipe loop0
+	ded -y create loop0 ntfs 100 MiB
+	ded -y resize loop0 1 500 MiB
+	ded -y resize loop0 1 50 MiB
+	ded -y resize loop0 1
 }
 
 main() {
@@ -105,14 +109,14 @@ main() {
 		make_disk
 	fi
 
-	#test_argparsing
+	test_argparsing
 	#test_fs
-	test_holes
-	test_resize
+	#test_holes
+	#test_resize
 
 	sudo parted -s /dev/loop0 unit B print free
 	sudo parted -s /dev/loop0 unit MiB print free
-	sudo ./ded.sh /dev/loop0
+	sudo ./ded.sh print loop0
 }
 
 main "${@}"

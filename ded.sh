@@ -51,6 +51,7 @@ confirm() {
 	case "${yn}" in
 		[yY][eE][sS]|[yY]) ;;
 		*)
+			trap '' EXIT
 			exit 1
 	esac
 	printf "\n"
@@ -355,7 +356,8 @@ create_cmd() {
 		esac
 	fi
 	get_section "${target_num}"
-	
+
+	[ $# -gt 0 ] || (print_help && exit 1)
 	target_type="${1}"; shift
 	fs_type="${target_type}"
 	default_name="Unnamed partition"
