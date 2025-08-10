@@ -22,8 +22,6 @@
 # SOFTWARE.
 
 # Simplified filesystem-aware partition manager
-# Depends on external tools:
-# parted, resize2fs, fatresize, ntfsresize, mke2fs, mkdosfs, mkntfs
 set -e
 
 NORMAL_PRECISION="4"
@@ -133,8 +131,9 @@ parse_partline() {
 	# simplify linux-swap(new,v1,v0,old) etc situation
 	case "${p_type}" in
 		*swap*)
-			p_type="swap"
-			;;
+			p_type="swap" ;;
+		*fat*)
+			p_type="fat" ;;
 	esac
 	if contains "${p_flags}" "esp"; then
 		p_type="efi"
@@ -244,7 +243,7 @@ parse_device() {
 		fi
 		part_hook
 	done << EOF
-$(parted -ms "${device}" unit B print free)
+$(parted -ms "${device}" unit B print free || fail "Could not read from device")
 EOF
 }
 
@@ -279,7 +278,7 @@ printall() {
 		fail "Could not find any devices! (You might need sudo)"
 	fi
 
-	printf "Byte quantities often approximate.\n"
+	printf "Byte quantities approximated to %s digits.\n" "${NORMAL_PRECISION}"
 	for bd in ${block_devices}; do
 		print_device "${bd}"
 	done
@@ -363,20 +362,22 @@ create_cmd() {
 	case "${target_type}" in
 		"ext4")
 			default_name="Linux filesystem data"
-			assert_exists "mke2fs"
+			assert_exists "mkfs.ext4"
 			;;
-		"fat32")
+		"fat")
 			default_name="Basic data partition"
-			assert_exists "mkdosfs"
+			# TODO: this might be dependent on the partition size sometimes?
+			fs_type="fat32"
+			assert_exists "mkfs.vfat"
 			;;
 		"efi")
 			default_name="EFI System partition"
 			fs_type="fat32"
-			assert_exists "mkdosfs"
+			assert_exists "mkfs.vfat"
 			;;
 		"ntfs")
 			default_name="Basic data partition"
-			assert_exists "mkntfs"
+			assert_exists "mkfs.ntfs"
 			;;
 		"swap")
 			default_name="Swap partition"
@@ -437,19 +438,19 @@ create_cmd() {
 
 	case "${target_type}" in
 		"ext4")
-			yes 2>/dev/null | mke2fs -q -t ext4 -L "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
-		"fat32")
-			mkdosfs -n "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
+			yes 2>/dev/null | mkfs.ext4 -q -L "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
+		"fat")
+			mkfs.vfat -n "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
 		"efi")
 			# turn off basic data flag. want: boot, esp, no_automount
 			parted -s "${device}" set "${r_part}" msftdata off || fail "Failed to set flag"
 			# seems that "boot" and "esp" are aliases for the same thing
 			parted -s "${device}" set "${r_part}" esp on || fail "Failed to set flag"
 			parted -s "${device}" set "${r_part}" no_automount on || fail "Failed to set flag"
-			mkdosfs -n "${target_name}" "${r_partdevice}" || fail "Failed to format partition!"
+			mkfs.vfat -n "${target_name}" "${r_partdevice}" || fail "Failed to format partition!"
 			;;
 		"ntfs")
-			mkntfs -L "${target_name}" "${r_partdevice}" || fail "Failed to format partition!"
+			mkfs.ntfs -L "${target_name}" "${r_partdevice}" || fail "Failed to format partition!"
 			;;
 		"swap")
 			mkswap -L "${target_name}" "${r_partdevice}" || fail "Failed to format partition!"
@@ -475,7 +476,7 @@ resize_fs() {
 			# resize2fs doesn't take bytes. units are powers of two, M==MiB
 			resize2fs "${partdevice}" "${in_mib}M" || fail "Failed to resize ext4!"
 			;;
-		"fat32")
+		"fat")
 			assert_exists "fatresize"
 			fatresize -q -f -s "${in_mib}Mi" "${partdevice}" || fail "Failed to resize fat32!"
 			;;
@@ -604,6 +605,7 @@ lshift_cmd() {
 	# parted doesn't support resizing "to the left" afaik. Remove and recreate partition
 	parted -s "${device}" rm "${from}" || fail "Failed to remove existing partition!"
 	parted -s "${device}" unit B mkpart \""${from_name}"\" "${from_fs}" "${to_start}" "${new_end}" || fail "Failed to re-create partition!"
+	# """
 	get_part "${to_start}"
 	OIFS="${IFS}"
 	IFS=' ,'
@@ -630,22 +632,22 @@ wipe_cmd() {
 # TODO: move, backup, restore, renumber(sort?)
 print_help() {
 	cat << EOF
-${0} DEVICE COMMAND
+${0} COMMAND DEVICE
 ${0} is a simplified partition manager that is filesystem aware.
-If no arguments are given, partitions are listed for all devices.
-If no COMMAND is given, partitions are listed for DEVICE.
+If no COMMAND is given, partition are listed for all devices
 
 COMMANDs:
-create [NUMBER] TYPE [NAME] [SIZE] create new partition/filesystem at NUMBER
-resize NUMBER [SIZE]               shrink/grow partition/filesystem NUMBER
-remove NUMBER                      remove partition NUMBER
-lshift NUMBER                      shift NUMBER to preceding empty space
-wipe                               start a new gpt partition table
+print  [DEV]                        print partition summary for DEV
+create DEV [NUM] TYPE [NAME] [SIZE] create new partition/filesystem at NUMB
+resize DEV NUM [SIZE]               shrink/grow partition/filesystem NUM
+remove DEV NUM                      remove partition NUM
+lshift DEV NUM                      shift NUM to preceding empty space
+wipe                                start a new gpt partition table
 
-Negative NUMBERs denote free space large enough for new partitions.
-If omitted NUMBER defaults to the first available free space (-1).
+Negative NUMs denote free space large enough for new partitions.
+If omitted NUM defaults to the first available free space (-1).
 
-Supported TYPEs: ext4, fat32, efi, ntfs, swap
+Supported TYPEs: ext4, fat, efi, ntfs, swap
 efi is a fat32 filesystem with the esp, boot, and no_automount flags set.
 swap is a linux-swap(v1) filesystem with the swap flag set.
 
@@ -662,7 +664,7 @@ The same NAME is used to label both the partition and filesystem if supported.
 Required external commands for full functionality:
 parted
 resize2fs, fatresize, ntfsresize
-mke2fs, mkdosfs, mkntfs
+mkfs.ext4, mkfs.vfat, mkfs.ntfs
 EOF
 }
 
@@ -673,18 +675,36 @@ main() {
 	if [ "${1}" = "-h" ]; then
 		print_help && exit 0
 	fi
-	device="${1}"; shift
-	if [ ! -b "${device}" ]; then
-		print_help && exit 1
-	fi
-	if [ $# -eq 0 ]; then
-		printf "Byte quantities approximated to %s digits.\n" "${NORMAL_PRECISION}"
-		print_device "${device}"
-		exit 0
+	if [ "${1}" = "-y" ]; then
+		shift
+		confirm() {
+			echo "-y was given, proceeding automatically..."
+		}
 	fi
 
 	command="${1}"; shift
+	if [ "${command}" = "print" ]; then
+		if [ $# -eq 0 ]; then
+			printall && exit 0
+		fi
+	fi
+
+	if [ $# -eq 0 ]; then
+		print_help && exit 0
+	fi
+	device="${1}"; shift
+	if [ -b "/dev/${device}" ]; then
+		device="/dev/${device}"
+	fi
+	if [ ! -b "${device}" ]; then
+		print_help && exit 1
+	fi
+
 	case "${command}" in
+		"print")
+			printf "Byte quantities approximated to %s digits.\n" "${NORMAL_PRECISION}"
+			print_device "${device}"
+			;;
 		"create") create_cmd "${@}";;
 		"resize") resize_cmd "${@}";;
 		"remove") rm_cmd "${@}";;
