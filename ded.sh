@@ -366,9 +366,6 @@ create_cmd() {
 			;;
 		"fat32")
 			default_name="Basic data partition"
-			# TODO: this might be dependent on the partition size sometimes?
-			# TODO: Should not create fat32 smaller than 512MiB
-			# https://support.microsoft.com/en-us/topic/description-of-default-cluster-sizes-for-fat32-file-system-905ea1b1-5c4e-a03f-3863-e4846a878d31
 			fs_type="fat32"
 			assert_exists "mkfs.vfat"
 			;;
