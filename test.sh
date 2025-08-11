@@ -42,55 +42,55 @@ make_disk() {
 
 test_argparsing() {
 	ded -y wipe loop0
-	ded -y create loop0 -1 fat
+	ded -y create loop0 -1 fat32
 	ded -y wipe loop0
-	ded -y create loop0 fat
+	ded -y create loop0 fat32
 	ded -y wipe loop0
-	ded -y create loop0 fat "foo bar"
+	ded -y create loop0 fat32 "foo bar"
 	ded -y wipe loop0
-	ded -y create loop0 fat "foo bar" 8MiB
+	ded -y create loop0 fat32 "foo bar" 512MiB
 	ded -y wipe loop0
-	ded -y create loop0 fat "" 8MiB
+	ded -y create loop0 fat32 "" 512 MiB
 }
 
 test_fs() {
 	ded -y wipe loop0
-	ded -y create loop0 efi   8 MiB
+	ded -y create loop0 efi   512 MiB
 	ded -y create loop0 ext4  8 MiB
 	ded -y create loop0 ntfs  8 MiB
-	ded -y create loop0 fat32 8 MiB
 	ded -y create loop0 swap
+	ded -y wipe loop0
+	ded -y create loop0 fat32   512 MiB
 }
 
 test_holes() {
 	ded -y wipe loop0
-	ded -y create loop0 fat32 8 MiB
-	ded -y create loop0 fat32 8 MiB
+	ded -y create loop0 fat32 512 MiB
+	ded -y create loop0 ext4 8 MiB
 	ded -y create loop0 ext4  8 MiB
-	ded -y create loop0 fat32 8 MiB
-	ded -y create loop0 fat32 8 MiB
-	ded -y create loop0 fat32 8 MiB
+	ded -y create loop0 ext4 8 MiB
+	ded -y create loop0 ext4 8 MiB
+	ded -y create loop0 ext4 8 MiB
 	ded -y remove loop0 2
 	ded -y remove loop0 5
 	# add some strange flags to test recreating them
-	sudo parted loop0 set 3 hidden on
-	sudo parted loop0 set 3 hp-service on
-	ded-y lshift loop0 3
+	sudo parted /dev/loop0 set 3 hidden on
+	sudo parted /dev/loop0 set 3 hp-service on
+	ded -y lshift loop0 3
 	# new partition is 2
 	ded -y resize loop0 2
 }
 
 test_resize() {
-	# experimentally ~260MiB is the smallest fatresize/libparted wants to work with
 	ded -y wipe loop0
-	ded -y create loop0 fat32 300 MiB
-	ded -y resize loop0 1 500 MiB
-	ded -y resize loop0 1 350 MiB
+	ded -y create loop0 fat32 700 MiB
+	ded -y resize loop0 1 512 MiB
+	ded -y resize loop0 1 800 MiB
 
 	ded -y wipe loop0
-	ded -y create loop0 efi 300 MiB
-	ded -y resize loop0 1 500 MiB
-	ded -y resize loop0 1 350 MiB
+	ded -y create loop0 efi 700 MiB
+	ded -y resize loop0 1 512 MiB
+	ded -y resize loop0 1 800 MiB
 
 	ded -y wipe loop0
 	ded -y create loop0 ext4 100 MiB
@@ -110,9 +110,9 @@ main() {
 	fi
 
 	test_argparsing
-	#test_fs
-	#test_holes
-	#test_resize
+	test_fs
+	test_holes
+	test_resize
 
 	sudo parted -s /dev/loop0 unit B print free
 	sudo parted -s /dev/loop0 unit MiB print free

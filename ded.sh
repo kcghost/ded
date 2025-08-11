@@ -133,8 +133,6 @@ parse_partline() {
 	case "${p_type}" in
 		*swap*)
 			p_type="swap" ;;
-		*fat*)
-			p_type="fat" ;;
 	esac
 	if contains "${p_flags}" "esp"; then
 		p_type="efi"
@@ -295,10 +293,10 @@ get_section() {
 			r_start="${p_start}"
 			r_end="${p_end}"
 			r_size="${p_size}"
-			r_type="${p_type}"
 			r_name="${p_name}"
 			r_fs="${p_fs}"
 			r_flags="${p_flags}"
+			r_type="${p_type}"
 		fi
 	}
 	parse_device "${device}"
@@ -366,9 +364,11 @@ create_cmd() {
 			default_name="Linux filesystem data"
 			assert_exists "mkfs.ext4"
 			;;
-		"fat")
+		"fat32")
 			default_name="Basic data partition"
 			# TODO: this might be dependent on the partition size sometimes?
+			# TODO: Should not create fat32 smaller than 512MiB
+			# https://support.microsoft.com/en-us/topic/description-of-default-cluster-sizes-for-fat32-file-system-905ea1b1-5c4e-a03f-3863-e4846a878d31
 			fs_type="fat32"
 			assert_exists "mkfs.vfat"
 			;;
@@ -410,6 +410,14 @@ create_cmd() {
 	# correct alignment, at least according to checkpartitionsalignment.sh
 	target_end=$(( target_start + target_size - 1 ))
 	
+	case "${fs_type}" in
+		"fat32")
+			if [ "${target_size}" -lt "$(( 512 * 1024 * 1024 ))" ]; then
+				fail "Creating FAT32 filesystems less than 512 MiB is not supported!"
+			fi
+			;;
+	esac
+
 	print_device "${device}"
 
 	printf "number: %s\n" "${target_num}"
@@ -441,7 +449,7 @@ create_cmd() {
 	case "${target_type}" in
 		"ext4")
 			yes 2>/dev/null | mkfs.ext4 -q -L "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
-		"fat")
+		"fat32")
 			mkfs.vfat -n "${target_name}" "${r_partdevice}" || fail "Failed to format partition!" ;;
 		"efi")
 			# turn off basic data flag. want: boot, esp, no_automount
@@ -478,8 +486,11 @@ resize_fs() {
 			# resize2fs doesn't take bytes. units are powers of two, M==MiB
 			resize2fs "${partdevice}" "${in_mib}M" || fail "Failed to resize ext4!"
 			;;
-		"fat")
+		"fat32")
 			assert_exists "fatresize"
+			if [ "${size}" -lt "$(( 512 * 1024 * 1024 ))" ]; then
+				fail "Resizing fat32 filesystems less than 512 MiB is not supported!"
+			fi
 			fatresize -q -f -s "${in_mib}Mi" "${partdevice}" || fail "Failed to resize fat32!"
 			;;
 		"ntfs")
@@ -528,6 +539,7 @@ resize_cmd() {
 		parted -s "${device}" unit B resizepart "${target_num}" "${target_end}" || fail "Failed to resize partition!"
 		sync
 		partprobe
+		# TODO: undo partition change on fail
 		resize_fs "${r_partdevice}" "${target_fs}" "${wanted_size}"
 		
 		print_device "${device}"
@@ -649,7 +661,7 @@ wipe                                start a new gpt partition table
 Negative NUMs denote free space large enough for new partitions.
 If omitted NUM defaults to the first available free space (-1).
 
-Supported TYPEs: ext4, fat, efi, ntfs, swap
+Supported TYPEs: ext4, fat32, efi, ntfs, swap
 efi is a fat32 filesystem with the esp, boot, and no_automount flags set.
 swap is a linux-swap(v1) filesystem with the swap flag set.
 
