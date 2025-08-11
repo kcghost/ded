@@ -645,7 +645,8 @@ print_help() {
 	cat << EOF
 ${0} COMMAND DEVICE
 ${0} is a simplified partition manager that is filesystem aware.
-If no COMMAND is given, partition are listed for all devices
+If no COMMAND is given, partitions are listed for all devices.
+If -y is given no confirmation prompts will be given.
 
 COMMANDs:
 print  [DEV]                        print partition summary for DEV

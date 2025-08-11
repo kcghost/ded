@@ -13,19 +13,21 @@ Always back up important data before using this or any other partition managemen
 ## Usage
 
 ```
-ded is a simplified partition manager that is filesystem aware.
-If no arguments are given, partitions are listed for all devices.
-If no COMMAND is given, partitions are listed for DEVICE.
+./ded.sh COMMAND DEVICE
+./ded.sh is a simplified partition manager that is filesystem aware.
+If no COMMAND is given, partitions are listed for all devices.
+If -y is given no confirmation prompts will be given.
 
 COMMANDs:
-create [NUMBER] TYPE [NAME] [SIZE] create partition/filesystem in NUMBER
-resize NUMBER [SIZE]               shrink or grow partition/filesystem NUMBER
-remove NUMBER                      remove partition NUMBER
-lshift NUMBER                      shift NUMBER to preceding empty space
-wipe                               start a new gpt partition table
+print  [DEV]                        print partition summary for DEV
+create DEV [NUM] TYPE [NAME] [SIZE] create new partition/filesystem at NUMB
+resize DEV NUM [SIZE]               shrink/grow partition/filesystem NUM
+remove DEV NUM                      remove partition NUM
+lshift DEV NUM                      shift NUM to preceding empty space
+wipe                                start a new gpt partition table
 
-Negative NUMBERs denote free space large enough for new partitions.
-If omitted NUMBER defaults to the first available free space (-1).
+Negative NUMs denote free space large enough for new partitions.
+If omitted NUM defaults to the first available free space (-1).
 
 Supported TYPEs: ext4, fat32, efi, ntfs, swap
 efi is a fat32 filesystem with the esp, boot, and no_automount flags set.
@@ -44,7 +46,7 @@ The same NAME is used to label both the partition and filesystem if supported.
 Required external commands for full functionality:
 parted
 resize2fs, fatresize, ntfsresize
-mke2fs, mkdosfs, mkntfs
+mkfs.ext4, mkfs.vfat, mkfs.ntfs
 ```
 
 The following example uses a partition table set up by a Windows 11 install on a wiped disk.
@@ -53,7 +55,7 @@ It also aligns each partition start and end to 1MiB, which `ded` also does for e
 The example resizes the Windows install to make room for a Linux dual boot.
 
 ```
-/ # ded
+~ # ded
 Byte quantities often approximate.
 /dev/sda ( 149 GiB) gpt "ATA INTEL SSDSA2BW16"
   1:    1 MiB - 1025 MiB (   1 GiB)    efi "EFI System partition"
@@ -62,7 +64,7 @@ Byte quantities often approximate.
   4:  148 GiB -  149 GiB ( 642 MiB) msdiag ""
  -1:  149 GiB -  149 GiB (1863 KiB)   free ""
 
-/ # ded /dev/sda resize 3 80 GiB
+~ # ded resize sda 3 80 GiB
 /dev/sda ( 149 GiB) gpt "ATA INTEL SSDSA2BW16"
   1:    1 MiB - 1025 MiB (   1 GiB)    efi "EFI System partition"
   2: 1025 MiB - 1041 MiB (  16 MiB)  msres "Microsoft reserved partition"
@@ -116,16 +118,71 @@ Information: You may need to update /etc/fstab.
 
 Success!
 
+~ # ded create sda -1 ext4 63 GiB
+/dev/sda ( 149 GiB) gpt "ATA INTEL SSDSA2BW16"
+  1:    1 MiB - 1025 MiB (   1 GiB)    efi "EFI System partition"
+  2: 1025 MiB - 1041 MiB (  16 MiB)  msres "Microsoft reserved partition"
+  3: 1041 MiB -   81 GiB (  80 GiB)   ntfs "Basic data partition"
+ -1:   81 GiB -  148 GiB (  67 GiB)   free ""
+  4:  148 GiB -  149 GiB ( 642 MiB) msdiag ""
+ -2:  149 GiB -  149 GiB (1863 KiB)   free ""
 
-```
+number: -1
+ start:              82961 MiB (~  81 GiB)
+   end:       154636648447   B (~ 144 GiB)
+  size:                 63 GiB (~  63 GiB)
+  type: ext4
+fstype: ext4
+  name: Linux filesystem data
+The next operations will create a new partition and format it.
+Proceed? [y/N] y
 
+The next operation will format new partition 5 on block device /dev/sda5.
+Warning: label too long; will be truncated to 'Linux filesystem'
 
-```
-sudo ded /dev/sda wipe
-sudo ded /dev/sda create efi  1GiB
-sudo ded /dev/sda create ext4 100GiB
-sudo ded /dev/sda create swap 4GiB
-sudo ded /dev/sda create ntfs
+/dev/sda ( 149 GiB) gpt "ATA INTEL SSDSA2BW16"
+  1:    1 MiB - 1025 MiB (   1 GiB)    efi "EFI System partition"
+  2: 1025 MiB - 1041 MiB (  16 MiB)  msres "Microsoft reserved partition"
+  3: 1041 MiB -   81 GiB (  80 GiB)   ntfs "Basic data partition"
+  5:   81 GiB -  144 GiB (  63 GiB)   ext4 "Linux filesystem data"
+ -1:  144 GiB -  148 GiB (4511 MiB)   free ""
+  4:  148 GiB -  149 GiB ( 642 MiB) msdiag ""
+ -2:  149 GiB -  149 GiB (1863 KiB)   free ""
+
+Success!
+~ # ded create sda -1 swap
+/dev/sda ( 149 GiB) gpt "ATA INTEL SSDSA2BW16"
+  1:    1 MiB - 1025 MiB (   1 GiB)    efi "EFI System partition"
+  2: 1025 MiB - 1041 MiB (  16 MiB)  msres "Microsoft reserved partition"
+  3: 1041 MiB -   81 GiB (  80 GiB)   ntfs "Basic data partition"
+  5:   81 GiB -  144 GiB (  63 GiB)   ext4 "Linux filesystem data"
+ -1:  144 GiB -  148 GiB (4511 MiB)   free ""
+  4:  148 GiB -  149 GiB ( 642 MiB) msdiag ""
+ -2:  149 GiB -  149 GiB (1863 KiB)   free ""
+
+number: -1
+ start:             147473 MiB (~ 144 GiB)
+   end:       159366774783   B (~ 148 GiB)
+  size:               4511 MiB (~4511 MiB)
+  type: swap
+fstype: linux-swap(v1)
+  name: Swap partition
+The next operations will create a new partition and format it.
+Proceed? [y/N] y
+
+The next operation will format new partition 6 on block device /dev/sda6.
+Setting up swapspace version 1, size = 4730122240 bytes
+UUID=83ce3bb6-bef1-4c8a-a9d4-4ce8879b9a9e
+/dev/sda ( 149 GiB) gpt "ATA INTEL SSDSA2BW16"
+  1:    1 MiB - 1025 MiB (   1 GiB)    efi "EFI System partition"
+  2: 1025 MiB - 1041 MiB (  16 MiB)  msres "Microsoft reserved partition"
+  3: 1041 MiB -   81 GiB (  80 GiB)   ntfs "Basic data partition"
+  5:   81 GiB -  144 GiB (  63 GiB)   ext4 "Linux filesystem data"
+  6:  144 GiB -  148 GiB (4511 MiB)   swap "Swap partition"
+  4:  148 GiB -  149 GiB ( 642 MiB) msdiag ""
+ -1:  149 GiB -  149 GiB (1863 KiB)   free ""
+
+Success!
 ```
 
 ### Recommended partition sizes
@@ -138,7 +195,7 @@ Here are some recommended sizing guidelines:
 | fat32 | Removable media | >=512 MiB |
 | ntfs  | Windows         | >=64 GiB  |
 | ext4  | Ubuntu          | >=25 GiB  |
-| swap  | Normal          | 4 GiB     |
+| swap  | Normal          | 1-4 GiB   |
 | swap  | Hibernation     | 1.5x RAM  |
 
 In general I recommend only considering either whole numbers of GiB or "the rest of it" when considering partition sizes.
