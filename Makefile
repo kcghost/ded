@@ -1,7 +1,10 @@
 .PHONY: check test install
 
+all: gpt
+
 check:
 	shellcheck ded.sh
+	shellcheck gpt.sh
 
 test:
 	./test.sh
