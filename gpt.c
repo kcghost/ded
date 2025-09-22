@@ -26,23 +26,59 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <linux/fs.h>
 #include <uchar.h>
 #include <wchar.h>
 #include <locale.h>
 #include <limits.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/random.h>
+#include <linux/fs.h>
+#include <linux/hdreg.h>
 
 char* program_name = "gpt";
 int flags = 0;
-// just not handling sizing outside the current spec
+int first_print = 1;
+// minimal size without extra reserved space (that must be zero in current spec)
 #define HDR_SZ  92
 #define PART_SZ 128
+// semi-arbitrary size for buffered read/write
+#define BLOCK_SZ 512
 // 12 digits can represent 1 PiB in 4096 blocks
 #define BLOCKS_DIGITS 12
 // longest known type alias "root-loongarch64-verity-sig"
 #define TYPE_DIGITS 27
+
+typedef struct {
+	int head;
+	int sector;
+	int cylinder;
+} chs;
+
+typedef struct __attribute__((__packed__)) {
+	uint8_t  head;
+	// the first two high bits are part of a 10-bit cylinder value, the rest is "sector"
+	uint8_t  ch_sector;
+	// 8 low bits of cylinder
+	uint8_t  cl;
+} mbr_chs;
+
+typedef struct __attribute__((__packed__)) {
+	uint8_t  boot_indicator;
+	mbr_chs  start;
+	uint8_t  type;
+	mbr_chs  end;
+	uint32_t start_lba;
+	uint32_t size_lba;
+} mbr_part;
+
+typedef struct __attribute__((__packed__)) {
+	uint8_t   boot_code[440];
+	uint32_t  unique_sig;
+	uint16_t  unknown;
+	mbr_part  part[4];
+	uint16_t  signature;
+} mbr;
 
 // https://uefi.org/specs/UEFI/2.11/05_GUID_Partition_Table_Format.html
 typedef struct __attribute__((__packed__)) {
@@ -73,6 +109,7 @@ typedef struct __attribute__((__packed__)) {
 	uint64_t end_lba;
 	union __attribute__((__packed__)) {
 		uint64_t attr;
+		// TODO: bitflags like this are not very portable, they could get reversed or worse
 		struct __attribute__((__packed__)) {
 			uint64_t efiflags:3;
 			uint64_t reserved:45;
@@ -112,21 +149,43 @@ typedef struct {
 	int fd;
 	unsigned int lbsz;
 	uint64_t last_lba;
+	struct hd_geometry geo;
 	gpt_hdr hdr;
-	int max_label_digits;
 	int max_size_digits;
+	int part_entries;
+	int padding[4];
+	int max_entries;
+	char* arg_guid;
+	uint32_t hdr_sz;
+	uint32_t part_sz;
 } gpt_dev;
 
 #define str(token) #token
 #define xstr(token) str(token)
-#define fail(...) do { fputs("crit: ", stderr); fprintf(stderr, __VA_ARGS__); exit(EXIT_FAILURE); } while(0)
-#define warn(...) do { fputs("warn: ", stderr); fprintf(stderr, __VA_ARGS__); } while(0)
+#define fail(...) do { fputs("crit: ", stderr); fprintf(stderr, __VA_ARGS__); fputs("\n", stderr); exit(EXIT_FAILURE); } while(0)
+#define warn(...) do { fputs("warn: ", stderr); fprintf(stderr, __VA_ARGS__); fputs("\n", stderr); } while(0)
 #define wr(condition, msg, code) do { if(condition) { warn(msg "\n"); return code; } } while(0)
 
 int digits(uint64_t i) {
 	int digits = 1;
 	while((i = i / 10) > 0) { digits++; }
 	return digits;
+}
+
+chs mtochs(mbr_chs mchs) {
+	chs r;
+	r.head = mchs.head;
+	r.sector = mchs.ch_sector & 0b00111111;
+	r.cylinder = ((mchs.ch_sector & 0b11000000)<<2) | mchs.cl;
+	return r;
+}
+
+mbr_chs chstom(chs c) {
+	mbr_chs r;
+	r.head = c.head;
+	r.ch_sector = c.sector | (c.cylinder>>8);
+	r.cl = c.cylinder & 0b11111111;
+	return r;
 }
 
 // crc adapted from public domain code: https://web.mit.edu/freebsd/head/sys/libkern/crc32.c
@@ -181,27 +240,91 @@ uint32_t crc32(uint32_t start, const void *buf, size_t size) {
 	uint32_t crc;
 
 	crc = start ^ 0xFFFFFFFF;
-	while (size--) {
+	while(size--) {
 		crc = crc32_tab[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+	}
+	return crc ^ 0xFFFFFFFF;
+}
+
+// without needing a buffer predict the crc32 for a given number of blank bytes
+uint32_t crc32_zero(uint32_t start, size_t size) {
+	uint32_t crc;
+
+	crc = start ^ 0xFFFFFFFF;
+	while(size--) {
+		crc = crc32_tab[crc & 0xFF] ^ (crc >> 8);
 	}
 	return crc ^ 0xFFFFFFFF;
 }
 
 #define UUID_STR_SZ 37
 void uuid_str(char* str, uint8_t* bytes) {
+	// the first 3 sections are little-endian for...reasons? reasons.
 	snprintf(
 		str, UUID_STR_SZ,
 		"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
 		bytes[3],  bytes[2],  bytes[1],  bytes[0],
-		bytes[5],  bytes[4],  bytes[7],  bytes[6],
+		bytes[5],  bytes[4],
+		bytes[7],  bytes[6],
 		bytes[8],  bytes[9],  bytes[10], bytes[11],
 		bytes[12], bytes[13], bytes[14], bytes[15]
 	);
 }
 
+void parse_guid(char* in, uint8_t* dst) {
+	// TODO: do the thing
+}
+
+void gen_guid4(uint8_t* dst) {
+	// RFC4122 version 4 (random guid), but this explains guids much better than the RFC: https://guid.one/guid/make
+	// Almost all GUIDs in practical use for EFI are version 4, even very early ones like ms-basic and linux-generic
+	// Though it is neat you can tell the esp guid was generated at exactly 1999-04-21T19:24:01.5625	
+	// grub introduced a "bios" one that is just the bytes "Hah!IdontNeedEFI", and is not compliant at all
+	// nobody *really* cares, but ideally it should be RFC4122 compliant.
+	if(getrandom(dst, 16, 0) != 16) { fail("could not get random bytes!"); }
+	dst[6] = dst[6] & 0x0f | 0x40;
+	dst[8] = dst[8] & 0x3f | 0x80;
+}
+
 void seekread(int fd, off_t offset, void* buf, size_t count) {
 	if(lseek(fd, offset, SEEK_SET) == -1) { fail("seek"); }
 	if(read(fd, buf, count) != count) { fail("read"); }
+}
+
+// if not zero return -1
+int seekread_zero(int fd, off_t offset, size_t count) {
+	uint8_t buf[BLOCK_SZ] = {0};
+
+	if(lseek(fd, offset, SEEK_SET) == -1) { fail("seek"); }
+	while(count > BLOCK_SZ) {
+		count = count - BLOCK_SZ;
+		if(read(fd, buf, BLOCK_SZ) != BLOCK_SZ) { perror(""); fail("read"); }
+		for(int i = 0; i < BLOCK_SZ; i++) { if(buf[i] != 0) { return -1; } }
+	}
+	if(count) {
+		if(read(fd, buf, count) != count) { perror(""); fail("read"); }
+		for(int i = 0; i < count; i++) { if(buf[i] != 0) { return -1; } }
+	}
+	
+	return 0;
+}
+
+void seekwrite(int fd, off_t offset, void* buf, size_t count) {
+	if(lseek(fd, offset, SEEK_SET) == -1) { fail("seek"); }
+	if(write(fd, buf, count) != count) { perror(""); fail("write"); }
+}
+
+void seekwrite_zero(int fd, off_t offset, size_t count) {
+	uint8_t buf[BLOCK_SZ] = {0};
+
+	if(lseek(fd, offset, SEEK_SET) == -1) { fail("seek"); }
+	while(count > BLOCK_SZ) {
+		count = count - BLOCK_SZ;
+		if(write(fd, buf, BLOCK_SZ) != BLOCK_SZ) { perror(""); fail("write"); }
+	}
+	if(count) {
+		if(write(fd, buf, count) != count) { perror(""); fail("write"); }
+	}
 }
 
 #define NOT_GPT -1
@@ -210,56 +333,85 @@ void seekread(int fd, off_t offset, void* buf, size_t count) {
 #define CORRUPT_PTABLE -4
 #define CORRUPT_BACKUP -5
 
-int validate_header(gpt_hdr* hdr, gpt_dev* dev) {
-	uint32_t crc;
+int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
+	uint32_t reported_crc;
+	uint32_t calc_crc;
 	part_entry part;
 	int len;
 	
-	wr(strncmp("EFI PART", hdr->signature, 8) != 0, "not GPT!", NOT_GPT);
-
-	crc = hdr->crc;
-	hdr->crc = 0;
-	wr(crc32(0, hdr, hdr->header_size) != crc, "header integrity check failed!", CORRUPT);
-	hdr->crc = crc;
-	
+	if(strncmp("EFI PART", hdr->signature, 8) != 0) { return NOT_GPT; }
+	wr(hdr->header_size < HDR_SZ || hdr->header_size > dev->lbsz, "illegal header size!", UNEXPECTED);
 	wr(hdr->revision_major != 1 || hdr->revision_minor != 0, "unexpected GPT revision!", UNEXPECTED);
-	wr(hdr->header_size != HDR_SZ, "invalid header size", UNEXPECTED);
-	wr(hdr->entry_size != PART_SZ, "can't handle large part entry sizes", UNEXPECTED);
+	
+	reported_crc = hdr->crc;
+	hdr->crc = 0;
+	calc_crc = crc32(0, hdr, HDR_SZ);
+	// the header can be bigger than HDR_SZ, but the extra space *must* be zeroed
+	if(hdr->header_size > HDR_SZ) {
+		calc_crc = crc32_zero(calc_crc, hdr->header_size - HDR_SZ);
+	}
+	wr(seekread_zero(dev->fd, (lba * dev->lbsz) + HDR_SZ, hdr->header_size - HDR_SZ) != 0, "reserved part of header not zero!", UNEXPECTED);
+	wr(calc_crc != reported_crc, "header integrity check failed!", CORRUPT);
+	hdr->crc = reported_crc;
+	wr(hdr->entry_size * hdr->ptable_entries < (16*1024), "partition table too small!", UNEXPECTED);
 
-	crc = 0;
+	// it might not be practical, but any power of two greater than 128 is legal
+	if(hdr->entry_size < 128 || (hdr->entry_size & (hdr->entry_size - 1)) != 0) {
+		warn("illegal partition entry size!");
+		return UNEXPECTED;
+	}
+
+	calc_crc = 0;
 	for(int i = 0; i < hdr->ptable_entries; i++) {
 		seekread(dev->fd, (hdr->ptable_lba * dev->lbsz) + (i * hdr->entry_size), &part, sizeof(part));
 		wr(part.reserved != 0, "unexpected partition attributes in reserved field!", UNEXPECTED);
-		crc = crc32(crc, &part, PART_SZ);
+		calc_crc = crc32(calc_crc, &part, PART_SZ);
+		for(int j = 0; j < 16; j++) {
+			if(part.type[j] != 0) {
+				dev->part_entries++;
+				break;
+			}
+		}
+		// each entry may be bigger than 128, but the extra space *must* be zeroed
+		if(hdr->entry_size > PART_SZ) {
+			calc_crc = crc32_zero(calc_crc, hdr->entry_size - PART_SZ);
+			wr(seekread_zero(dev->fd,
+				(hdr->ptable_lba * dev->lbsz) + 
+				(i * hdr->entry_size) + PART_SZ,
+				hdr->entry_size - PART_SZ) != 0,
+			"reserved part of part entry not zero!", UNEXPECTED);
+		}
 	}
-	wr(crc != hdr->ptable_crc, "corrupted partition table!", CORRUPT_PTABLE);
+	wr(calc_crc != hdr->ptable_crc, "corrupted partition table!", CORRUPT_PTABLE);
 
 	return 0;
 }
 
+// populate hdr and validate the device is actually GPT
 int check_device(gpt_dev* dev) {
 	gpt_hdr alt;
 	int primary_ret;
 	int alt_ret;
 
+	seekread(dev->fd, (1 * dev->lbsz), &(dev->hdr), sizeof(dev->hdr));
 	seekread(dev->fd, (dev->last_lba * dev->lbsz), &alt, sizeof(alt));
 
-	primary_ret = validate_header(&(dev->hdr), dev);
-	alt_ret = validate_header(&alt, dev);
+	primary_ret = validate_header(&(dev->hdr), dev, 1);
+	alt_ret = validate_header(&alt, dev, dev->last_lba);
 
 	if(primary_ret == NOT_GPT && alt_ret == NOT_GPT) {
 		return NOT_GPT;
 	}
 	if(primary_ret != 0 && alt_ret == 0) {
-		warn("primary GPT table is faulty. But the backup appears fine, maybe try restoring the backup?\n");
+		warn("primary GPT table is faulty. But the backup appears fine, maybe try restoring the backup?");
 		return primary_ret;
 	}
 	if(primary_ret == 0 && alt_ret != 0) {
-		warn("backup GPT table is faulty. But the primary table appears fine, maybe try rewriting the backup?\n");
+		warn("backup GPT table is faulty. But the primary table appears fine, maybe try rewriting the backup?");
 		return CORRUPT_BACKUP;
 	}
 	if(primary_ret != 0 && alt_ret != 0) {
-		warn("Both primary and backup tables are faulty!\n");
+		warn("Both primary and backup tables are faulty!");
 		return primary_ret;
 	}
 
@@ -268,20 +420,41 @@ int check_device(gpt_dev* dev) {
 	wr(alt.this_lba != dev->hdr.alt_lba, "unexpected lba address in alt", UNEXPECTED);
 	wr(alt.ptable_crc != dev->hdr.ptable_crc, "backup table has different contents!", UNEXPECTED);
 
+	wr(dev->hdr.ptable_lba <= 1 || dev->hdr.ptable_lba >= dev->hdr.first_lba, "bad ptable address in primary!", UNEXPECTED);
+	wr(alt.ptable_lba >= dev->last_lba || alt.ptable_lba <= alt.last_lba, "bad ptable address in backup!", UNEXPECTED);
+
+	// check that disk guid and other fields are exactly the same as primary
+	alt.this_lba = 1;
+	alt.alt_lba = dev->last_lba;
+	alt.ptable_lba = dev->hdr.ptable_lba;
+	alt.crc = 0;
+	wr(crc32(0, &alt, sizeof(alt)) != dev->hdr.crc, "primary and backup headers dont have the same contents", UNEXPECTED);
+	
 	return 0;
 }
 
-int open_device(char* device, gpt_dev* dev)  {
+int open_device(char* device, gpt_dev* dev, int rflag)  {
 	uint64_t size_bytes;
-	wr((dev->fd = open(device, O_RDONLY)) == -1, "could not open device", -1);
-	wr((ioctl(dev->fd, BLKSSZGET, &(dev->lbsz))) != 0, "block size", -1);
-	wr((ioctl(dev->fd, BLKGETSIZE64, &size_bytes)) != 0, "device size", -1);
+	wr((dev->fd = open(device, rflag)) == -1, "could not open device", -1);
+	if(ioctl(dev->fd, BLKSSZGET, &(dev->lbsz)) != 0) {
+		warn("%s not a block device, assuming 512 is the logical block size", device);
+		dev->lbsz = 512;
+	}
+	if(ioctl(dev->fd, BLKGETSIZE64, &size_bytes) != 0) {
+		// might just be a file rather than a block device
+		wr((size_bytes = lseek(dev->fd, 0, SEEK_END)) == -1, "could not get device size!", -1);
+	}
+
+	if(ioctl(dev->fd, HDIO_GETGEO, &(dev->geo)) != 0) {
+		warn("could not read geometry for %s, assuming traditional max values for hpc and spt", device);
+		dev->geo.heads = 255;
+		dev->geo.sectors = 63;
+	}
 
 	dev->last_lba = (size_bytes / dev->lbsz) - 1;
 	dev->max_size_digits = digits(dev->last_lba);
-	
-	seekread(dev->fd, (1 * dev->lbsz), &(dev->hdr), sizeof(dev->hdr));
-	if(dev->hdr.this_lba != 1) { fail("unexpected current lba"); }
+
+	dev->max_entries = 128; // default
 
 	strcpy(dev->device, device);
 
@@ -297,7 +470,7 @@ void iterate_part(gpt_dev* dev, void (*on_part)(gpt_dev* dev, int num, part_entr
 		// if type id is not all zeroes trigger on_part
 		for(int i = 0; i < 16; i++) {
 			if(part.type[i] != 0) {
-				on_part(dev, part_num, &part);
+				on_part(dev, part_num + 1, &part);
 				break;
 			}
 		}
@@ -323,18 +496,18 @@ int validate_device(gpt_dev* dev) {
 		case 0:
 			break;
 		case NOT_GPT:
-			wprintf(L"%hs not_gpt\n", dev->device);
+			warn("%s does not have gpt table.", dev->device);
 			break;
 		case UNEXPECTED:
-			warn("An unexpected problem occurred validating the partition table on %s.\n"
-				"This could indicate a corrupt table. Or just that this program can't handle a new format or edge case.\n", dev->device);
+			warn("An unexpected problem occurred validating the partition table on %s."
+				"This could indicate a corrupt table. Or just that this program can't handle a new format or edge case.", dev->device);
 			break;
 		case CORRUPT:
 		case CORRUPT_PTABLE:
 		case CORRUPT_BACKUP:
 		default:
-			warn("A corruption problem was detected on %s.\n"
-				"You may need to restore or rewrite the backup table. Or start a new table.\n", dev->device);
+			warn("A corruption problem was detected on %s."
+				"You may need to restore or rewrite the backup table. Or start a new table.", dev->device);
 			break;
 	}
 	return ret;
@@ -393,41 +566,246 @@ void print_part(gpt_dev* dev, int num, part_entry* part) {
 	wprintf(L"|%s\n", name);
 }
 
-void print_device(char* device) {
+void print_device(gpt_dev* dev) {
 	int ret;
-	gpt_dev dev = {0};
+	mbr m = {0};
+	chs start;
+	chs end;
 	char uuid[UUID_STR_SZ];
-	
-	if(open_device(device, &dev) != 0) { return; }
-	if(validate_device(&dev) != 0) { return; }
 
-	uuid_str(uuid, dev.hdr.disk_guid);
-	fprintf(stderr, "%-*s|%-36s|%-*s|logical block size\n",
-		(int)strlen(device), "path", "disk uuid", dev.max_size_digits,"last");
-	wprintf(L"%s|%s|%lu|%u\n", device, uuid, dev.last_lba, dev.lbsz);
-	
-	// num uuid start end common-attr type type-attr label
-	fprintf(stderr, "num|%-36s|%-*s|%-*s|%-36s|cmn|type attributes |label\n",
-		"uuid", dev.max_size_digits,"start", dev.max_size_digits,"end", "typeid"
+	// print separator breaks after first print
+	if(first_print) {
+		first_print = 0;
+	} else {
+		fprintf(stderr, "\n");
+	}
+
+	fprintf(stderr,
+		"dsk|%-*s|lbsz|%-*s|hpc|spt|cyls |start sector\n",
+		(int)strlen(dev->device),"path",
+		dev->max_size_digits, "last lb"
 	);
-	iterate_part(&dev, print_part);
+	wprintf(L"dsk|%s|%04u|%0*u|%03u|%03u|%05u|%lu\n",
+		dev->device,
+		dev->lbsz,
+		dev->max_size_digits,dev->last_lba,
+		dev->geo.heads,
+		dev->geo.sectors,
+		dev->geo.cylinders,
+		dev->geo.start
+	);
+
+	seekread(dev->fd, 0, &m, sizeof(m));
+	if(m.signature == 0xaa55) {
+		fprintf(stderr,"mbr|uniq sig|code crc|unknown\n");
+		wprintf(L"mbr|%08x|%08x|%04x\n",
+			m.unique_sig,
+			crc32(0, m.boot_code, sizeof(m.boot_code)),
+			m.unknown
+		);
+		fprintf(stderr,"mN|os|start     |size      |shd|ss|scyl|ehd|es|ecyl\n");
+		for(int i = 0; i < 4; i++) {
+			start = mtochs(m.part[i].start);
+			end = mtochs(m.part[i].end);
+			wprintf(L"m%d|%02x|%010u|%010u|%03u|%02u|%04u|%03u|%02u|%04u\n",
+				i,
+				m.part[i].type,
+				m.part[i].start_lba,
+				m.part[i].size_lba,
+				start.head,
+				start.sector,
+				start.cylinder,
+				end.head,
+				end.sector,
+				end.cylinder
+			);
+		}
+	}
+
+	if(validate_device(dev) != 0) { return; }
+
+	uuid_str(uuid, dev->hdr.disk_guid);
+	fprintf(stderr,
+		"gpt|%-36s|%-*s|%-*s|max entries\n",
+		"disk uuid",
+		dev->max_size_digits,"fst avl",
+		dev->max_size_digits,"lst avl"
+	);
+	wprintf(L"gpt|%s|%0*lu|%0*lu|%u\n",
+		uuid,
+		dev->max_size_digits, dev->hdr.first_lba, dev->max_size_digits,dev->hdr.last_lba,
+		dev->hdr.ptable_entries
+	);
+	
+	if(dev->part_entries) {
+		// num uuid start end common-attr type type-attr label
+		fprintf(stderr, "num|%-36s|%-*s|%-*s|%-36s|cmn|type attributes |label\n",
+			"partuuid",
+			dev->max_size_digits,"start", dev->max_size_digits,"end", "type"
+		);
+		iterate_part(dev, print_part);
+	}
+}
+
+void print_devices() {
+	FILE* parts;
+	unsigned int major;
+	unsigned int minor;
+	uint64_t blocks;
+	char name[NAME_MAX];
+	char path[PATH_MAX];
+	
+	gpt_dev dev = {0};
+
+	if((parts = fopen("/proc/partitions", "r")) == NULL) { fail("could not read /proc/partitions!"); }
+	// throw away header
+	fgets(name, NAME_MAX, parts);
+	fgets(name, NAME_MAX, parts);
+
+	while(!ferror(parts) && !feof(parts)) {
+		if(fscanf(parts, "%u %u %lu %s", &major, &minor, &blocks, name) == 4) {
+			snprintf(path, PATH_MAX, "/sys/block/%s", name);
+			if(access(path, F_OK) == 0) {
+				snprintf(path, PATH_MAX, "/dev/%s", name);
+				if(open_device(path, &dev, O_RDONLY) != 0) {
+					continue;
+				}
+				print_device(&dev);
+				close(dev.fd);
+			}
+		}
+	}
+	fclose(parts);
+}
+
+void write_mbr(gpt_dev* dev) {
+	mbr m = {0};
+	uint16_t cylinder;
+	chs end;
+
+	m.part[0].type = 0xee; // GPT protective
+	m.part[0].start_lba = 1;
+	m.part[0].size_lba = dev->last_lba > UINT32_MAX ? UINT32_MAX : (uint32_t)dev->last_lba;
+	m.part[0].start.ch_sector = 2; // sector == lba % spt + 1, lba is 1.
+
+	// https://en.wikipedia.org/wiki/Logical_block_addressing#CHS_conversion
+	// max cylinder in this addressing is 2^10-1. lba can be too large to represent
+	if(dev->last_lba >= (1024 * (dev->geo.heads * dev->geo.sectors))) {
+		// if too large use max values
+		end.cylinder = 1023;
+		end.head = 255;
+		end.sector = 63;
+	} else {
+		end.cylinder = dev->last_lba / (dev->geo.heads * dev->geo.sectors);
+		end.head = (dev->last_lba / dev->geo.sectors) % dev->geo.heads;
+		end.sector = (dev->last_lba % dev->geo.sectors) + 1;
+	}
+	m.part[0].end = chstom(end);
+	m.signature = 0xaa55;
+	seekwrite(dev->fd, 0, &m, sizeof(m));
+}
+
+void write_gpt(gpt_dev* dev) {
+	gpt_hdr h = {0};
+	int table_sz; // in blocks
+
+	strncpy(h.signature,"EFI PART", 8); // size prevents null terminator, that's okay
+	h.revision_major = 1;
+	h.revision_minor = 0;
+	// bigger is legal, but is reserved and *must* be zero
+	h.header_size = HDR_SZ;
+	if(dev->hdr_sz > HDR_SZ) {
+		h.header_size = dev->hdr_sz;
+	}
+	// must be 128*2n. But currently anything after 128 is reserved and must be zero.
+	h.entry_size = PART_SZ;
+	if(dev->part_sz > PART_SZ) {
+		h.entry_size = dev->part_sz;
+	}
+	
+	h.this_lba = 1;
+	h.alt_lba = dev->last_lba; // last lba of the whole device, not "last usable"
+	// req: ptable_lba > 1 and ptable_lba < first_lba - and likewise reversed for alt
+	// which implies you can add as much "padding" as you want before and after both tables
+	// why on earth you might want that - who knows. roll your own metadata in lba 2 perhaps.
+	// its easy enough to support and its fun to be weird.
+	h.ptable_lba = 2 + dev->padding[0]; // normally just 2
+	// must be enough so that the table is at least 16KiB large
+	h.ptable_entries = dev->max_entries; // normally 128
+	// normally 32 (128*128/512==32)
+	table_sz = ((PART_SZ * h.ptable_entries) + dev->lbsz - 1) / dev->lbsz;
+	h.first_lba = h.ptable_lba + table_sz + dev->padding[1];
+	h.last_lba = h.alt_lba - 1 - dev->padding[3] - table_sz - dev->padding[2];
+
+	if(dev->arg_guid != NULL) {
+		parse_guid(dev->arg_guid, h.disk_guid);
+	} else {
+		gen_guid4(h.disk_guid);
+	}
+	h.ptable_crc = crc32_zero(0, h.ptable_entries * h.entry_size);
+	h.crc = crc32(0, &h, HDR_SZ);
+	if(dev->hdr_sz > HDR_SZ) {
+		h.crc = crc32_zero(h.crc, dev->hdr_sz - HDR_SZ);
+		// just zero out whole header space and overwrite
+		seekwrite_zero(dev->fd, 1 * dev->lbsz, dev->hdr_sz);
+	}
+	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
+	seekwrite(dev->fd, 1 * dev->lbsz, &h, HDR_SZ);
+
+	h.crc = 0;
+	h.this_lba = dev->last_lba;
+	h.alt_lba = 1;
+	h.ptable_lba = h.last_lba + 1 + dev->padding[2];
+	h.crc = crc32(0, &h, HDR_SZ);
+	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &h, HDR_SZ);
 }
 
 void usage() {
-	wprintf(
-		L"Usage: %hs [OPTIONS] [DEVICE]\n"
+	wprintf(L""
+		"%hs [-f]\n"
+		"%hs [DEVICE] [COMMANDS]\n"
+
 		"\n"
 		"Print or modify contents of GPT partition tables.\n"
-		"If no DEVICE is provided all disks are listed.\n"
 		"\n"
-		"OPTIONs:\n"
-		"-f      interpret attributes as comma separated flags\n"
-		"        notice: type attributes may be wrong depedning on type\n" 
+		"If no DEVICE is provided all known devices are printed.\n"
+		"COMMANDS are performed in order given. Will print if none provided.\n"
 		"\n"
-		, program_name);
+		"WARNING: This is a raw editing tool primarily to be used by scripts.\n"
+		"Most commands are performed with no sanity checks or confirmations.\n"
+		"\n"
+		"COMMANDS:\n"
+		"-f         Interpret well known attributes as comma separated flags\n"
+		"           may be used without a DEVICE to affect listing\n"
+		"           note: type attributes may be incorrect depending on type!\n"
+		"-L LBSZ    Override logical block size (normally reported or 512)\n"
+		"           useful if DEVICE is a file\n"
+		"-B BLOCK   Override last block of DEVICE (total size in blocks - 1)\n"
+		"-G HPC SPT Override geometry: heads per cylinder(255), sectors per track(63)\n"
+		"           used in building protective MBR\n"
+		"-N MAX     Use MAX entries when building or resizing a GPT table. Defaults to 128.\n"
+		"           Each entry is 128 bytes. Be careful the table itself won't overlap the first partition.\n"
+		"           Typically 128*128/512 is 32 contiguous blocks. Past MBR and GPT header the first available is lba 34.\n"
+		"           Assuming p1 start==1MiB,lbsz==512 you could have (1048576-(512*2))/128==8184 entries.\n"
+		"-P A B C D Add padding around part tables(in number of blocks) when building GPT table )-g).\n"
+		"           before primary table (after lba 1), after primary table,\n"
+		"           before backup table, after backup table(before last).\n"
+		"-R H P     Use custom header and part entry sizing when building a GPT table (-g).\n"
+		"           H<=lbsz. P must be a power of 2 and >128. The extra reserved space will be zeroed.\n"
+		"-p         Print\n"
+		"-m         Build and write a new protective MBR\n"
+		"-g         Build and write new blank GPT table (wipes all partitions!)\n"
+		"-r         Resize an existing table for more entries (see -N). Keeps existing entries <= MAX."
+		"-l GUID    Relabel disk id to GUID."
+		"\n"
+		, program_name, program_name);
 }
 
 int main(int argc, char* argv[]) {
+	int cmd_processed = 0;
+	gpt_dev dev = {0};
+
 	// set locale to system default, so we can print "wide" characters with wprintf (for UTF-16 partition label)
 	// Once either printf or wprintf is used the other stops working for that stream
 	// Use wprintf for stdout, regular printf for stderr
@@ -437,10 +815,35 @@ int main(int argc, char* argv[]) {
 		program_name = argv[0];
 		argv++;
 	}
-	if(argv[0] == NULL) {
-		usage();
-		return 1;
+
+	if(argv[0] != NULL && argv[0][0] != '-') {
+		if(open_device(argv[0], &dev, O_RDWR) != 0) { fail("could not open device!"); }
+		argv++;
+	} else {
+		// no device provided. only handle print options
+		while(argv[0] != NULL && argv[0][0] == '-') {
+			while(argv[0][1] != '\0') {
+				switch(argv[0][1]) {
+					case 'h':
+						usage();
+						return 0;
+					case 'f':
+						flags = 1;
+						break;
+					default:
+						usage();
+						return 1;
+				}
+				argv[0]++;
+			}
+next_printopt:
+			argv++;
+		}
+
+		print_devices();
+		return 0;
 	}
+
 	while(argv[0] != NULL && argv[0][0] == '-') {
 		while(argv[0][1] != '\0') {
 			switch(argv[0][1]) {
@@ -450,16 +853,71 @@ int main(int argc, char* argv[]) {
 				case 'f':
 					flags = 1;
 					break;
+				case 'L':
+					if(argv[1] == NULL) { fail("need argument!"); }
+					dev.lbsz = atoi(argv[1]);
+					warn("overriding logical block size to %u", dev.lbsz);
+					argv += 1;
+					goto next_cmd;
+				case 'G':
+					if(argv[1] == NULL || argv[2] == NULL) { fail("need arguments!"); }
+					dev.geo.heads = atoi(argv[1]);
+					dev.geo.sectors = atoi(argv[2]);
+					warn("overriding geometry hpc:%u spt:%u", dev.geo.heads, dev.geo.sectors);
+					argv += 2;
+					goto next_cmd;
+				case 'B':
+					if(argv[1] == NULL) { fail("need argument!"); }
+					dev.last_lba = strtol(argv[1], NULL, 10);
+					dev.max_size_digits = digits(dev.last_lba);
+					warn("overriding last lba to %lu", dev.last_lba);
+					argv += 1;
+					goto next_cmd;
+				case 'N':
+					if(argv[1] == NULL) { fail("need argument!"); }
+					dev.max_entries = atoi(argv[1]);
+					argv += 1;
+					goto next_cmd;
+				case 'P':
+					if(argv[1] == NULL || argv[2] == NULL || argv[3] == NULL || argv[4] == NULL) { fail("need arguments!"); }
+					dev.padding[0] = atoi(argv[1]);
+					dev.padding[1] = atoi(argv[2]);
+					dev.padding[2] = atoi(argv[3]);
+					dev.padding[3] = atoi(argv[4]);
+					argv += 4;
+					goto next_cmd;
+				case 'R':
+					if(argv[1] == NULL || argv[2] == NULL) { fail("need arguments!"); }
+					dev.hdr_sz = atoi(argv[1]);
+					dev.part_sz = atoi(argv[2]);
+					argv += 2;
+					goto next_cmd;
+				case 'p':
+					cmd_processed = 1;
+					print_device(&dev);
+					break;
+				case 'm':
+					cmd_processed = 1;
+					write_mbr(&dev);
+					break;
+				case 'g':
+					cmd_processed = 1;
+					write_gpt(&dev);
+					break;
 				default:
 					usage();
 					return 1;
 			}
 			argv[0]++;
 		}
+next_cmd:
 		argv++;
 	}
 
-	print_device(argv[0]);
-	
+	if(!cmd_processed) {
+		print_device(&dev);
+	}
+
+	close(dev.fd);
 	return 0;
 }
