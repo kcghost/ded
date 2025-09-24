@@ -107,6 +107,7 @@ test_resize() {
 main() {
 	if [ "${1}" = "-r" ]; then
 		make_disk
+		exit 0
 	fi
 
 	test_argparsing
