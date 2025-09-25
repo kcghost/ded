@@ -37,7 +37,6 @@
 #include <linux/hdreg.h>
 
 char* program_name = "gpt";
-int flags = 0;
 int first_print = 1;
 // minimal size without extra reserved space (that must be zero in current spec)
 #define MBR_SZ 512
@@ -423,6 +422,8 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 	}
 	wr(calc_crc != hdr->ptable_crc, "corrupted partition table!", CORRUPT_PTABLE);
 
+	wr(hdr->this_lba != lba, "unexpected lba address!", UNEXPECTED);
+
 	return 0;
 }
 
@@ -439,11 +440,11 @@ int check_device(gpt_dev* dev) {
 		return NOT_GPT;
 	}
 	if(primary_ret != 0 && alt_ret == 0) {
-		warn("primary GPT table is faulty. But the backup appears fine, maybe try restoring the backup?");
+		warn("Primary GPT table is faulty. But the backup appears fine, maybe try restoring the primary?");
 		return primary_ret;
 	}
 	if(primary_ret == 0 && alt_ret != 0) {
-		warn("backup GPT table is faulty. But the primary table appears fine, maybe try rewriting the backup?");
+		warn("Backup GPT table is faulty. But the primary table appears fine, maybe try restoring the backup?");
 		return CORRUPT_BACKUP;
 	}
 	if(primary_ret != 0 && alt_ret != 0) {
@@ -456,19 +457,10 @@ int check_device(gpt_dev* dev) {
 	wr(dev->alt.this_lba != dev->hdr.alt_lba, "unexpected lba address in alt", UNEXPECTED);
 	wr(dev->alt.ptable_crc != dev->hdr.ptable_crc, "backup table has different contents!", UNEXPECTED);
 
+	// TODO: verify table doesn't run over partition space or last header
 	wr(dev->hdr.ptable_lba <= 1 || dev->hdr.ptable_lba >= dev->hdr.first_lba, "bad ptable address in primary!", UNEXPECTED);
 	wr(dev->alt.ptable_lba >= dev->last_lba || dev->alt.ptable_lba <= dev->alt.last_lba, "bad ptable address in backup!", UNEXPECTED);
-
-	// check that disk guid and other fields are exactly the same as primary
-	dev->alt.this_lba = 1;
-	dev->alt.alt_lba = dev->last_lba;
-	dev->alt.ptable_lba = dev->hdr.ptable_lba;
-	dev->alt.crc = 0;
-	calc_crc = crc32(0, &(dev->alt), HDR_SZ);
-	if(dev->alt.header_size > HDR_SZ) {
-		calc_crc = crc32_zero(calc_crc, dev->alt.header_size - HDR_SZ);
-	}
-	wr(calc_crc != dev->hdr.crc, "primary and backup headers dont have the same contents", UNEXPECTED);
+	wr(memcmp(dev->hdr.disk_guid, dev->alt.disk_guid, 16) != 0, "backup header has different identifier!", UNEXPECTED);
 	
 	dev->is_valid_gpt = 1;
 	return 0;
@@ -532,7 +524,6 @@ void iterate_part(gpt_dev* dev, void (*on_part)(gpt_dev* dev, int num, part_entr
 	}
 }
 
-
 int validate_device(gpt_dev* dev) {
 	int ret;
 	ret = check_device(dev);
@@ -543,7 +534,7 @@ int validate_device(gpt_dev* dev) {
 			warn("%s does not have gpt table.", dev->device);
 			break;
 		case UNEXPECTED:
-			warn("An unexpected problem occurred validating the partition table on %s."
+			warn("An unexpected problem occurred validating the partition table on %s.\n"
 				"This could indicate a corrupt table. Or just that this program can't handle a new format or edge case.", dev->device);
 			break;
 		case CORRUPT:
@@ -551,7 +542,7 @@ int validate_device(gpt_dev* dev) {
 		case CORRUPT_BACKUP:
 		default:
 			warn("A corruption problem was detected on %s."
-				"You may need to restore or rewrite the backup table. Or start a new table.", dev->device);
+				"You may need to restore the backup table. Or start a new table.", dev->device);
 			break;
 	}
 	return ret;
@@ -585,7 +576,6 @@ void print_part(gpt_dev* dev, int num, part_entry* part) {
 
 void print_device(gpt_dev* dev) {
 	int ret;
-	mbr m = {0};
 	chs start;
 	chs end;
 	char uuid[UUID_STR_SZ];
@@ -615,19 +605,19 @@ void print_device(gpt_dev* dev) {
 	if(dev->m.signature == 0xaa55) {
 		fprintf(stderr,"mbr|uniq sig|code crc|unknown\n");
 		wprintf(L"mbr|%08x|%08x|%04x\n",
-			m.unique_sig,
-			crc32(0, m.boot_code, sizeof(m.boot_code)),
-			m.unknown
+			dev->m.unique_sig,
+			crc32(0, dev->m.boot_code, sizeof(dev->m.boot_code)),
+			dev->m.unknown
 		);
 		fprintf(stderr,"mN|os|start     |size      |shd|ss|scyl|ehd|es|ecyl\n");
 		for(int i = 0; i < 4; i++) {
-			start = mtochs(m.part[i].start);
-			end = mtochs(m.part[i].end);
+			start = mtochs(dev->m.part[i].start);
+			end = mtochs(dev->m.part[i].end);
 			wprintf(L"m%d|%02x|%010u|%010u|%03u|%02u|%04u|%03u|%02u|%04u\n",
 				i,
-				m.part[i].type,
-				m.part[i].start_lba,
-				m.part[i].size_lba,
+				dev->m.part[i].type,
+				dev->m.part[i].start_lba,
+				dev->m.part[i].size_lba,
 				start.head,
 				start.sector,
 				start.cylinder,
@@ -723,9 +713,91 @@ void write_mbr(gpt_dev* dev) {
 	seekwrite(dev->fd, 0, &m, MBR_SZ);
 }
 
+// recalculate crc for header
+void calc_hdr(gpt_hdr* hdr) {
+	uint32_t calc_crc;
+
+	hdr->crc = 0;
+	calc_crc = crc32(0, hdr, HDR_SZ);
+	if(hdr->header_size > HDR_SZ) {
+		calc_crc = crc32_zero(calc_crc, hdr->header_size - HDR_SZ);
+	}
+	hdr->crc = calc_crc;
+}
+
+// recalculate ptable crc and return the value
+uint32_t calc_ptable(gpt_dev* dev, gpt_hdr* hdr) {
+	uint32_t calc_crc = 0;
+	part_entry part;
+
+	for(int i = 0; i < hdr->ptable_entries; i++) {
+		seekread(dev->fd, (hdr->ptable_lba * dev->lbsz) + (i * hdr->entry_size), &part, PART_SZ);
+		calc_crc = crc32(calc_crc, &part, PART_SZ);
+
+		if(hdr->entry_size > PART_SZ) {
+			calc_crc = crc32_zero(calc_crc, hdr->entry_size- PART_SZ);
+		}
+	}
+	hdr->ptable_crc = calc_crc;
+	return calc_crc;
+}
+
+// copy from backup to primary
+void restore_primary(gpt_dev* dev) {
+	int table_sz_lb; // in blocks
+	part_entry part;
+	
+	if(validate_header(&(dev->alt), dev, dev->last_lba) != 0) { fail("there is a problem with the backup header!"); }
+	table_sz_lb = ((dev->alt.ptable_entries * dev->alt.entry_size) + dev->lbsz - 1) / dev->lbsz;
+
+	memcpy(&(dev->hdr), &(dev->alt), HDR_SZ);
+	dev->hdr.this_lba = 1;
+	dev->hdr.alt_lba = dev->last_lba;
+	dev->hdr.ptable_lba = 1 + 1 + dev->padding[0]; // normally just 2
+	if(dev->hdr.ptable_lba - 1 + table_sz_lb >= dev->hdr.first_lba) {
+		fail("too much padding! ptable won't fit!");
+	}
+	calc_hdr(&(dev->hdr));
+
+	for(int i = 0; i < dev->alt.ptable_entries; i++) {
+		seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (i * dev->alt.entry_size), &part, PART_SZ);
+		seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (i * dev->hdr.entry_size), &part, PART_SZ);
+	}
+	seekwrite(dev->fd, 1 * dev->lbsz, &(dev->hdr), HDR_SZ);
+
+	fprintf(stderr, "copied backup table to primary\n");
+}
+
+
+// copy from primary to backup
+void restore_backup(gpt_dev* dev) {
+	int table_sz_lb; // in blocks
+	part_entry part;
+
+	if(validate_header(&(dev->hdr), dev, 1) != 0) { fail("there is a problem with the primary header!"); }
+	table_sz_lb = ((dev->hdr.ptable_entries * dev->hdr.entry_size) + dev->lbsz - 1) / dev->lbsz;
+
+	memcpy(&(dev->alt), &(dev->hdr), HDR_SZ);
+	dev->alt.this_lba = dev->last_lba;
+	dev->alt.alt_lba = 1;
+	dev->alt.ptable_lba = dev->hdr.last_lba + 1 + dev->padding[2];
+	if(dev->alt.ptable_lba - 1 + table_sz_lb >= dev->last_lba) {
+		fail("too much padding! ptable won't fit!");
+	}
+	calc_hdr(&(dev->alt));
+
+	for(int i = 0; i < dev->hdr.ptable_entries; i++) {
+		seekread(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (i * dev->hdr.entry_size), &part, PART_SZ);
+		seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (i * dev->alt.entry_size), &part, PART_SZ);
+	}
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
+
+	fprintf(stderr, "copied primary table to backup\n");
+}
+
 void write_gpt(gpt_dev* dev) {
 	gpt_hdr h = {0};
-	int table_sz; // in blocks
+	int table_sz_lb; // in blocks
 
 	strncpy(h.signature,"EFI PART", 8); // size prevents null terminator, that's okay
 	h.revision_major = 1;
@@ -735,95 +807,44 @@ void write_gpt(gpt_dev* dev) {
 	if(dev->hdr_sz > HDR_SZ) {
 		h.header_size = dev->hdr_sz;
 	}
-	// must be 128*2n. But currently anything after 128 is reserved and must be zero.
-	// not really practical, but technically legal
+	// must be 128*2n. But currently anything after 128 is reserved and must be zero
 	h.entry_size = PART_SZ;
 	if(dev->part_sz > PART_SZ) {
 		h.entry_size = dev->part_sz;
 	}
-	
-	h.this_lba = 1;
-	h.alt_lba = dev->last_lba; // last lba of the whole device, not "last usable"
-	// req: ptable_lba > 1 and ptable_lba < first_lba - and likewise reversed for alt
-	// which implies you can add as much "padding" as you want before and after both tables
-	// its weird. but its easy enough to support and its fun.
-	h.ptable_lba = 2 + dev->padding[0]; // normally just 2
+
 	// must be enough so that the table is at least 16KiB large
 	h.ptable_entries = dev->max_entries; // normally 128
 	// normally 32 (128*128/512==32)
-	table_sz = ((h.ptable_entries * h.entry_size) + dev->lbsz - 1) / dev->lbsz;
-	h.first_lba = h.ptable_lba + table_sz + dev->padding[1];
-	h.last_lba = h.alt_lba - 1 - dev->padding[3] - table_sz - dev->padding[2];
+	table_sz_lb = ((h.ptable_entries * h.entry_size) + dev->lbsz - 1) / dev->lbsz;
+
+	// req: ptable_lba > 1 and ptable_lba < first_lba - and likewise reversed for alt
+	// which implies you can add as much "padding" as you want before and after both tables
+	// its weird. but its easy enough to support and its fun.
+	h.first_lba = 0 + 2 + dev->padding[0] + table_sz_lb + dev->padding[1];
+	h.last_lba = dev->last_lba - 1 - dev->padding[3] - table_sz_lb - dev->padding[2];
+
+	// do backup first, then write primary last
+	h.this_lba = dev->last_lba;
+	h.alt_lba = 1;
+	h.ptable_lba = h.last_lba + 1 + dev->padding[2];
 
 	if(not_zero(dev->id, 16)) {
 		memcpy(h.disk_guid, dev->id, 16);
 	} else {
 		gen_guid4(h.disk_guid);
 	}
-	
 	h.ptable_crc = crc32_zero(0, h.ptable_entries * h.entry_size);
-	h.crc = crc32(0, &h, HDR_SZ);
-	if(dev->hdr_sz > HDR_SZ) {
-		h.crc = crc32_zero(h.crc, dev->hdr_sz - HDR_SZ);
-		// just zero out whole header space and overwrite
-		seekwrite_zero(dev->fd, 1 * dev->lbsz, dev->hdr_sz);
-	}
-	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
-	seekwrite(dev->fd, 1 * dev->lbsz, &h, HDR_SZ);
-	memcpy(&(dev->hdr), &h, HDR_SZ);
 
-	h.crc = 0;
-	h.this_lba = dev->last_lba;
-	h.alt_lba = 1;
-	h.ptable_lba = h.last_lba + 1 + dev->padding[2];
-	h.crc = crc32(0, &h, HDR_SZ);
-	if(dev->hdr_sz > HDR_SZ) {
-		h.crc = crc32_zero(h.crc, dev->hdr_sz - HDR_SZ);
-		// just zero out whole header space and overwrite
-		seekwrite_zero(dev->fd, dev->last_lba * dev->lbsz, dev->hdr_sz);
-	}
-	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
-	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &h, HDR_SZ);
+	calc_hdr(&h);
 	memcpy(&(dev->alt), &h, HDR_SZ);
 
+	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &h, HDR_SZ);
+
+	restore_primary(dev);
+
 	fprintf(stderr, "wrote new GPT header and table\n");
-}
-
-// recalculate headers and rewrite them
-void rewrite_headers(gpt_dev* dev) {
-	uint32_t calc_crc;
-
-	dev->hdr.crc = 0;
-	calc_crc = crc32(0, &(dev->hdr), HDR_SZ);
-	if(dev->hdr.header_size > HDR_SZ) {
-		calc_crc = crc32_zero(calc_crc, dev->hdr.header_size - HDR_SZ);
-	}
-	dev->hdr.crc = calc_crc;
-
-	dev->alt.crc = 0;
-	calc_crc = crc32(0, &(dev->alt), HDR_SZ);
-	if(dev->alt.header_size > HDR_SZ) {
-		calc_crc = crc32_zero(calc_crc, dev->alt.header_size - HDR_SZ);
-	}
-	dev->alt.crc = calc_crc;
-
-	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
-	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
-}
-
-uint32_t calc_ptable(gpt_dev* dev) {
-	uint32_t calc_crc = 0;
-	part_entry part;
-
-	for(int i = 0; i < dev->hdr.ptable_entries; i++) {
-		seekread(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (i * dev->hdr.entry_size), &part, sizeof(part));
-		calc_crc = crc32(calc_crc, &part, PART_SZ);
-
-		if(dev->hdr.entry_size > PART_SZ) {
-			calc_crc = crc32_zero(calc_crc, dev->hdr.entry_size- PART_SZ);
-		}
-	}
-	return calc_crc;
 }
 
 void relabel_gpt(gpt_dev* dev) {
@@ -836,7 +857,11 @@ void relabel_gpt(gpt_dev* dev) {
 	}
 	memcpy(dev->alt.disk_guid, dev->hdr.disk_guid, 16);
 
-	rewrite_headers(dev);
+	calc_hdr(&(dev->alt));
+	calc_hdr(&(dev->hdr));
+
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
+	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
 }
 
 void set_entry(gpt_dev* dev, char* argv[]) {
@@ -849,8 +874,7 @@ void set_entry(gpt_dev* dev, char* argv[]) {
 	
 	ensure_valid(dev);
 	
-	num = strtol(argv[0], NULL, 10);
-	num = num - 1;
+	num = strtol(argv[0], NULL, 10) - 1;
 	if(num > dev->hdr.ptable_entries) { fail("entry does not exist!"); }
 	seekread(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
 	
@@ -889,13 +913,33 @@ void set_entry(gpt_dev* dev, char* argv[]) {
 
 	localtoc16(argv[7], part.name, PARTNAME_CHARS);
 
-	seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
+	// write to backup first, then the primary
 	seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &part, PART_SZ);
-	
-	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev);
-	rewrite_headers(dev);
+	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev, &(dev->alt));
+	calc_hdr(&(dev->alt));
+	calc_hdr(&(dev->hdr));
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
+	seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
+	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
 
-	fprintf(stderr, "wrote partition entry %u\n", num+1);
+	fprintf(stderr, "wrote partition entry %u\n", num + 1);
+}
+
+void del_entry(gpt_dev* dev, uint32_t num) {
+	ensure_valid(dev);
+
+	num = num - 1;
+
+	// write to backup first, then the primary
+	seekwrite_zero(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), PART_SZ);
+	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev, &(dev->alt));
+	calc_hdr(&(dev->alt));
+	calc_hdr(&(dev->hdr));
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
+	seekwrite_zero(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), PART_SZ);
+	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
+
+	fprintf(stderr, "deleted partition entry %u\n", num + 1);
 }
 
 void usage() {
@@ -931,8 +975,11 @@ void usage() {
 		"-m         Build and write a new protective MBR\n"
 		"-g         Build and write new blank GPT table (wipes all partitions!)\n"
 		"-r         Relabel an existing table with -U UUID, or a new random one if not provided.\n"
+		"-f         Restore the primary table from the backup table (-P before will be used).\n"
+		"-l         Restore the backup table from the primary table (-P before will be used).\n"
 		"-s NUM PARTID START END TYPEID TYPEATTR CMNATTR LABEL\n"
 		"           Set NUM partition entry. PARTID may be '-' to generate. Bits in ATTR may be '-' to skip existing flags.\n"
+		"-d NUM     Delete a partition entry (set all its contents to zero).\n"
 		"\n"
 		, program_name, program_name);
 }
@@ -962,9 +1009,6 @@ int main(int argc, char* argv[]) {
 					case 'h':
 						usage();
 						return 0;
-					case 'f':
-						flags = 1;
-						break;
 					default:
 						usage();
 						return 1;
@@ -985,9 +1029,6 @@ next_printopt:
 				case 'h':
 					usage();
 					return 0;
-				case 'f':
-					flags = 1;
-					break;
 				case 'L':
 					if(argv[1] == NULL) { fail("need argument!"); }
 					dev.lbsz = atoi(argv[1]);
@@ -1050,10 +1091,23 @@ next_printopt:
 					cmd_processed = 1;
 					relabel_gpt(&dev);
 					break;
+				case 'f':
+					cmd_processed = 1;
+					restore_primary(&dev);
+					break;
+				case 'l':
+					cmd_processed = 1;
+					restore_backup(&dev);
+					break;
 				case 's':
 					cmd_processed = 1;
 					set_entry(&dev, argv+1);
 					argv += 8;
+					goto next_cmd;
+				case 'd':
+					cmd_processed = 1;
+					del_entry(&dev, strtol(argv[1], NULL, 10));
+					argv += 1;
 					goto next_cmd;
 				default:
 					usage();
