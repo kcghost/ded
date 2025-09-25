@@ -49,6 +49,9 @@ int first_print = 1;
 // longest known type alias "root-loongarch64-verity-sig"
 #define TYPE_DIGITS 27
 
+#define getbit(in,bit) ((in >> bit) & 1)
+#define setbit(out,bit,val) out = (out & ~((typeof(out))1 << bit)) | ((typeof(out))(val) << bit)
+
 typedef struct {
 	int head;
 	int sector;
@@ -107,38 +110,7 @@ typedef struct __attribute__((__packed__)) {
 	uint8_t  id[16];
 	uint64_t start_lba;
 	uint64_t end_lba;
-	union __attribute__((__packed__)) {
-		uint64_t attr;
-		// TODO: bitflags like this are not very portable, they could get reversed or worse
-		struct __attribute__((__packed__)) {
-			uint64_t efiflags:3;
-			uint64_t reserved:45;
-			uint64_t typeflags:16;
-		};
-		// the last 16 are type id specific.
-		// But in practice well known flags dont yet overlap
-		struct __attribute__((__packed__)) {
-			// common efi attributes
-			uint64_t required:1;
-			uint64_t no_blockio:1;
-			uint64_t legacy_bootable:1;
-			uint64_t :45;
-			// chromeos
-			uint64_t priority:4;        // bits 48-51
-			uint64_t tries_remaining:4; // bits 52-55
-			uint64_t boot_success:1;    // bit 56
-			// not known to be used by any common types
-			uint64_t bit57:1;
-			uint64_t bit58:1;
-			// DPS spec
-			uint64_t growfs:1;          // bit 59
-			// MS flags, but DPS uses 63 and 60 with similar enough meanings
-			uint64_t read_only:1;       // bit 60
-			uint64_t shadow_copy:1;     // bit 61
-			uint64_t hidden:1;          // bit 62
-			uint64_t no_automount:1;    // bit 63
-		};
-	};
+	uint64_t attr;
 	char16_t name[PARTNAME_CHARS];
 	// rest of partition entry size and must be zero
 } part_entry;
@@ -186,6 +158,12 @@ mbr_chs chstom(chs c) {
 	r.ch_sector = c.sector | (c.cylinder>>8);
 	r.cl = c.cylinder & 0b11111111;
 	return r;
+}
+
+void bitstring(uint64_t in, int bits, char* out) {
+	for(int i = 0; i < bits; i++) {
+		out[i] = getbit(in, bits-1-i) ? '1' : '0';
+	}
 }
 
 // crc adapted from public domain code: https://web.mit.edu/freebsd/head/sys/libkern/crc32.c
@@ -382,7 +360,7 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 	calc_crc = 0;
 	for(int i = 0; i < hdr->ptable_entries; i++) {
 		seekread(dev->fd, (hdr->ptable_lba * dev->lbsz) + (i * hdr->entry_size), &part, sizeof(part));
-		wr(part.reserved != 0, "unexpected partition attributes in reserved field!", UNEXPECTED);
+		wr((part.attr & 0b0000000000000000111111111111111111111111111111111111111111111000)!= 0, "unexpected partition attributes in reserved field!", UNEXPECTED);
 		calc_crc = crc32(calc_crc, &part, PART_SZ);
 		if(not_zero(part.type, 16)) {
 			dev->part_entries++;
@@ -503,7 +481,36 @@ void c16tolocal(char16_t* in, char* out) {
 		out += r;
 	}
 	// write final null char
-	if((r = c16rtomb(out, in[0], &ps)) == -1) { fail("could not parse label!"); }
+	if(c16rtomb(out, in[0], &ps) == -1) { fail("could not parse label!"); }
+}
+
+void localtoc16(char* in, char16_t* out, size_t len) {
+	mbstate_t ps = {0};
+	size_t r;
+	char16_t* end = out + len;
+	
+	while(in[0] != '\0') {
+		r = mbrtoc16(out, in, 1, &ps);
+		switch(r) {
+			case -1:
+				fail("could not parse label!");
+			case -2:
+				in++;
+				break;
+			case -3:
+				out++;
+				break;
+			case 1:
+				in++;
+				out++;
+				break;
+			default:
+				fail("unexpected parsing error!");
+		}
+		if(out > end) { fail("label too long!"); }
+	}
+	// write final null char
+	if(mbrtoc16(out, in, 1, &ps) == -1) { fail("could not parse label!"); }
 }
 
 int validate_device(gpt_dev* dev) {
@@ -535,52 +542,26 @@ void print_part(gpt_dev* dev, int num, part_entry* part) {
 	char id_uuid[UUID_STR_SZ];
 	// just account for maximum possible length of localized string
 	char name[PARTNAME_CHARS * MB_LEN_MAX];
-	char typeflags_s[17];
+	char cmn_bits[3+1] = {0};
+	char type_bits[16+1] = {0};
 	int comma;
 	
 	uuid_str(type_uuid, part->type);
 	uuid_str(id_uuid, part->id);
 	c16tolocal(part->name, name);
 
-	// num uuid start end type common-attr type-attr label
-	// TODO: type short name lookup?
-#define pcomma do { if(comma) { wprintf(L","); } } while(0)
-#define pattr(attr) if(part->attr) { pcomma; wprintf(L"%s", xstr(attr)); comma = 1; }
-	wprintf(L"%03d|%s|%0*lu|%0*lu|%s|",
+	bitstring(part->attr >> 48, 16, type_bits);
+	bitstring(part->attr, 3, cmn_bits);
+
+	// num uuid start end type type-attr common-attr label
+	wprintf(L"%03d|%s|%0*lu|%0*lu|%s|%s|%s|%s\n",
 		num, id_uuid,
 		dev->max_size_digits,part->start_lba, dev->max_size_digits,part->end_lba,
-		type_uuid
+		type_uuid,
+		type_bits,
+		cmn_bits,
+		name
 	);
-
-	if(flags) {
-		comma = 0;
-		pattr(required);
-		pattr(no_blockio);
-		pattr(legacy_bootable);
-		wprintf(L"|");
-
-		// TODO: different handling based on type id?
-		comma = 0;
-		pattr(growfs);
-		pattr(read_only);
-		pattr(shadow_copy);
-		pattr(hidden);
-		pattr(no_automount);
-	} else {
-		for(int i = 0; i < 16; i++) {
-			typeflags_s[i] = '0' + ((part->typeflags >> i) & 1);
-		}
-		typeflags_s[16] = '\0';
-
-		wprintf(L"%c%c%c|%s",
-			part->required ? '1': '0',
-			part->no_blockio ? '1': '0',
-			part->legacy_bootable ? '1': '0',
-			typeflags_s
-		);
-	}
-	
-	wprintf(L"|%s\n", name);
 }
 
 void print_device(gpt_dev* dev) {
@@ -656,7 +637,7 @@ void print_device(gpt_dev* dev) {
 	
 	if(dev->part_entries) {
 		// num uuid start end common-attr type type-attr label
-		fprintf(stderr, "num|%-36s|%-*s|%-*s|%-36s|cmn|type attributes |label\n",
+		fprintf(stderr, "num|%-36s|%-*s|%-*s|%-36s|type attributes |cmn|label\n",
 			"partuuid",
 			dev->max_size_digits,"start", dev->max_size_digits,"end", "type"
 		);
@@ -833,6 +814,72 @@ void relabel_gpt(gpt_dev* dev) {
 	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &alt, HDR_SZ);
 }
 
+void set_entry(gpt_dev* dev, char* argv[]) {
+	uint32_t num;
+	part_entry part;
+	gpt_hdr alt;
+
+	for(int i = 0; i < 8; i++) {
+		if(argv[i] == NULL) { fail("not enough arguments for set!"); }
+	}
+	
+	if(validate_device(dev) != 0) { return; }
+	seekread(dev->fd, dev->last_lba * dev->lbsz, &alt, HDR_SZ);
+	
+	num = strtol(argv[0], NULL, 10);
+	num = num - 1;
+	if(num > dev->hdr.ptable_entries) { fail("entry does not exist!"); }
+	seekread(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
+	
+	if(argv[1][0] == '-') {
+		if(!not_zero(part.id, 16)) {
+			gen_guid4(part.id);
+		}
+	} else {
+		parse_uuid(argv[1], part.id);
+	}
+
+	part.start_lba = strtol(argv[2], NULL, 10);
+	if(part.start_lba < dev->hdr.first_lba) { fail("start too early!"); }
+	part.end_lba = strtol(argv[3], NULL, 10);
+	if(part.end_lba < part.start_lba) { fail("end too early!"); }
+	if(part.end_lba > dev->hdr.last_lba) { fail("end too late!"); }
+
+	if(argv[4][0] == '-') {
+		if(!not_zero(part.type, 16)) {
+			fail("new entry needs a type!");
+		}
+	} else {
+		parse_uuid(argv[4], part.type);
+	}
+
+	for(int i = 0; i < 16; i++) {
+		if(argv[5][i] == 0) { break; }
+		if(argv[5][i] == '-') { continue; }
+		setbit(part.attr, (15-i) + 48, argv[5][i] == '1');
+	}
+	for(int i = 0; i < 3; i++) {
+		if(argv[6][i] == 0) { break; }
+		if(argv[6][i] == '-') { continue; }
+		setbit(part.attr, (2-i), argv[6][i] == '1');
+	}
+
+	localtoc16(argv[7], part.name, PARTNAME_CHARS);
+
+	seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
+	seekwrite(dev->fd, (alt.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
+	
+	recalc_ptable(dev);
+	alt.ptable_crc = dev->hdr.ptable_crc;
+	recalc_header(&(dev->hdr));
+	recalc_header(&alt);
+
+	seekwrite(dev->fd, 1 * dev->lbsz, &(dev->hdr), HDR_SZ);
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &alt, HDR_SZ);
+
+	fprintf(stderr, "wrote partition entry %u\n", num+1);
+}
+
 void usage() {
 	wprintf(L""
 		"%hs [-f]\n"
@@ -847,9 +894,6 @@ void usage() {
 		"Most commands are performed with no sanity checks or confirmations.\n"
 		"\n"
 		"COMMANDS:\n"
-		"-f         Interpret well known attributes as comma separated flags\n"
-		"           may be used without a DEVICE to affect listing\n"
-		"           note: type attributes may be incorrect depending on type!\n"
 		"-L LBSZ    Override logical block size (normally reported or 512)\n"
 		"           useful if DEVICE is a file\n"
 		"-B BLOCK   Override last block of DEVICE (total size in blocks - 1)\n"
@@ -862,13 +906,15 @@ void usage() {
 		"-U UUID    Use specific UUID when building(-g) or rebuilding(-r) a GPT table."
 		"-P A B C D Add padding around part tables(in number of blocks) when building GPT table (-g).\n"
 		"           before primary table (after lba 1), after primary table,\n"
-		"           before backup table, after backup table(before last).\n"
+		"           before backup table, after backup table(before last header).\n"
 		"-R H P     Use custom header and part entry sizing when building a GPT table (-g).\n"
-		"           H<=lbsz. P must be a power of 2 and >128. The extra reserved space will be zeroed.\n"
+		"           H<=lbsz. P must be a power of 2 and >128. The extra reserved space must be zero.\n"
 		"-p         Print\n"
 		"-m         Build and write a new protective MBR\n"
 		"-g         Build and write new blank GPT table (wipes all partitions!)\n"
 		"-r         Re-label an existing table with -U UUID, or a new random one if not provided.\n"
+		"-s NUM PARTID START END TYPEID TYPEATTR CMNATTR LABEL\n"
+		"           Set NUM partition entry. PARTID may be '-' to generate. Bits in ATTR may be '-' to skip existing flags.\n"
 		"\n"
 		, program_name, program_name);
 }
@@ -986,6 +1032,11 @@ next_printopt:
 					cmd_processed = 1;
 					relabel_gpt(&dev);
 					break;
+				case 's':
+					cmd_processed = 1;
+					set_entry(&dev, argv+1);
+					argv += 8;
+					goto next_cmd;
 				default:
 					usage();
 					return 1;
