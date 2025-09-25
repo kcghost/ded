@@ -40,6 +40,7 @@ char* program_name = "gpt";
 int flags = 0;
 int first_print = 1;
 // minimal size without extra reserved space (that must be zero in current spec)
+#define MBR_SZ 512
 #define HDR_SZ  92
 #define PART_SZ 128
 // semi-arbitrary size for buffered read/write
@@ -82,6 +83,7 @@ typedef struct __attribute__((__packed__)) {
 	mbr_part  part[4];
 	uint16_t  signature;
 } mbr;
+_Static_assert(sizeof(mbr) == MBR_SZ, "bad mbr size!");
 
 // https://uefi.org/specs/UEFI/2.11/05_GUID_Partition_Table_Format.html
 typedef struct __attribute__((__packed__)) {
@@ -122,7 +124,10 @@ typedef struct {
 	unsigned int lbsz;
 	uint64_t last_lba;
 	struct hd_geometry geo;
+	mbr m;
 	gpt_hdr hdr;
+	gpt_hdr alt;
+	int is_valid_gpt;
 	int max_size_digits;
 	int part_entries;
 	int padding[4];
@@ -323,6 +328,47 @@ void seekwrite_zero(int fd, off_t offset, size_t count) {
 	}
 }
 
+void c16tolocal(char16_t* in, char* out) {
+	mbstate_t ps = {0};
+	size_t r;
+	while(in[0] != u'\0') {
+		if((r = c16rtomb(out, in[0], &ps)) == -1) { fail("could not parse label!"); }
+		in++;
+		out += r;
+	}
+	// write final null char
+	if(c16rtomb(out, in[0], &ps) == -1) { fail("could not parse label!"); }
+}
+
+void localtoc16(char* in, char16_t* out, size_t len) {
+	mbstate_t ps = {0};
+	size_t r;
+	char16_t* end = out + len;
+	
+	while(in[0] != '\0') {
+		r = mbrtoc16(out, in, 1, &ps);
+		switch(r) {
+			case -1:
+				fail("could not parse label!");
+			case -2:
+				in++;
+				break;
+			case -3:
+				out++;
+				break;
+			case 1:
+				in++;
+				out++;
+				break;
+			default:
+				fail("unexpected parsing error!");
+		}
+		if(out > end) { fail("label too long!"); }
+	}
+	// write final null char
+	if(mbrtoc16(out, in, 1, &ps) == -1) { fail("could not parse label!"); }
+}
+
 #define NOT_GPT -1
 #define UNEXPECTED -2
 #define CORRUPT -3
@@ -382,16 +428,12 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 
 // populate hdr and validate the device is actually GPT
 int check_device(gpt_dev* dev) {
-	gpt_hdr alt;
 	int primary_ret;
 	int alt_ret;
 	uint32_t calc_crc;
 
-	seekread(dev->fd, (1 * dev->lbsz), &(dev->hdr), sizeof(dev->hdr));
-	seekread(dev->fd, (dev->last_lba * dev->lbsz), &alt, sizeof(alt));
-
 	primary_ret = validate_header(&(dev->hdr), dev, 1);
-	alt_ret = validate_header(&alt, dev, dev->last_lba);
+	alt_ret = validate_header(&(dev->alt), dev, dev->last_lba);
 
 	if(primary_ret == NOT_GPT && alt_ret == NOT_GPT) {
 		return NOT_GPT;
@@ -411,24 +453,35 @@ int check_device(gpt_dev* dev) {
 
 	wr(dev->hdr.this_lba != 1, "unexpected lba address in primary", UNEXPECTED);
 	wr(dev->hdr.alt_lba != dev->last_lba, "unexpected alt lba address in primary", UNEXPECTED);
-	wr(alt.this_lba != dev->hdr.alt_lba, "unexpected lba address in alt", UNEXPECTED);
-	wr(alt.ptable_crc != dev->hdr.ptable_crc, "backup table has different contents!", UNEXPECTED);
+	wr(dev->alt.this_lba != dev->hdr.alt_lba, "unexpected lba address in alt", UNEXPECTED);
+	wr(dev->alt.ptable_crc != dev->hdr.ptable_crc, "backup table has different contents!", UNEXPECTED);
 
 	wr(dev->hdr.ptable_lba <= 1 || dev->hdr.ptable_lba >= dev->hdr.first_lba, "bad ptable address in primary!", UNEXPECTED);
-	wr(alt.ptable_lba >= dev->last_lba || alt.ptable_lba <= alt.last_lba, "bad ptable address in backup!", UNEXPECTED);
+	wr(dev->alt.ptable_lba >= dev->last_lba || dev->alt.ptable_lba <= dev->alt.last_lba, "bad ptable address in backup!", UNEXPECTED);
 
 	// check that disk guid and other fields are exactly the same as primary
-	alt.this_lba = 1;
-	alt.alt_lba = dev->last_lba;
-	alt.ptable_lba = dev->hdr.ptable_lba;
-	alt.crc = 0;
-	calc_crc = crc32(0, &alt, HDR_SZ);
-	if(alt.header_size > HDR_SZ) {
-		calc_crc = crc32_zero(calc_crc, alt.header_size - HDR_SZ);
+	dev->alt.this_lba = 1;
+	dev->alt.alt_lba = dev->last_lba;
+	dev->alt.ptable_lba = dev->hdr.ptable_lba;
+	dev->alt.crc = 0;
+	calc_crc = crc32(0, &(dev->alt), HDR_SZ);
+	if(dev->alt.header_size > HDR_SZ) {
+		calc_crc = crc32_zero(calc_crc, dev->alt.header_size - HDR_SZ);
 	}
 	wr(calc_crc != dev->hdr.crc, "primary and backup headers dont have the same contents", UNEXPECTED);
 	
+	dev->is_valid_gpt = 1;
 	return 0;
+}
+
+void ensure_valid(gpt_dev* dev) {
+	if(dev->is_valid_gpt == 0) {
+		check_device(dev);
+	}
+
+	if(dev->is_valid_gpt == 0) {
+		fail("not a valid gpt device! need to fix first!");
+	}
 }
 
 int open_device(char* device, gpt_dev* dev, int rflag)  {
@@ -456,6 +509,13 @@ int open_device(char* device, gpt_dev* dev, int rflag)  {
 
 	strcpy(dev->device, device);
 
+	// read entire mbr, primary gpt header, and backup gpt header
+	// partitions are read and checked on the fly
+	// none of these are necessarily valid at this point though
+	seekread(dev->fd, 0, &(dev->m), MBR_SZ);
+	seekread(dev->fd, (1 * dev->lbsz), &(dev->hdr), HDR_SZ);
+	seekread(dev->fd, (dev->last_lba * dev->lbsz), &(dev->alt), HDR_SZ);
+
 	return 0;
 }
 
@@ -472,46 +532,6 @@ void iterate_part(gpt_dev* dev, void (*on_part)(gpt_dev* dev, int num, part_entr
 	}
 }
 
-void c16tolocal(char16_t* in, char* out) {
-	mbstate_t ps = {0};
-	size_t r;
-	while(in[0] != u'\0') {
-		if((r = c16rtomb(out, in[0], &ps)) == -1) { fail("could not parse label!"); }
-		in++;
-		out += r;
-	}
-	// write final null char
-	if(c16rtomb(out, in[0], &ps) == -1) { fail("could not parse label!"); }
-}
-
-void localtoc16(char* in, char16_t* out, size_t len) {
-	mbstate_t ps = {0};
-	size_t r;
-	char16_t* end = out + len;
-	
-	while(in[0] != '\0') {
-		r = mbrtoc16(out, in, 1, &ps);
-		switch(r) {
-			case -1:
-				fail("could not parse label!");
-			case -2:
-				in++;
-				break;
-			case -3:
-				out++;
-				break;
-			case 1:
-				in++;
-				out++;
-				break;
-			default:
-				fail("unexpected parsing error!");
-		}
-		if(out > end) { fail("label too long!"); }
-	}
-	// write final null char
-	if(mbrtoc16(out, in, 1, &ps) == -1) { fail("could not parse label!"); }
-}
 
 int validate_device(gpt_dev* dev) {
 	int ret;
@@ -544,7 +564,6 @@ void print_part(gpt_dev* dev, int num, part_entry* part) {
 	char name[PARTNAME_CHARS * MB_LEN_MAX];
 	char cmn_bits[3+1] = {0};
 	char type_bits[16+1] = {0};
-	int comma;
 	
 	uuid_str(type_uuid, part->type);
 	uuid_str(id_uuid, part->id);
@@ -593,8 +612,7 @@ void print_device(gpt_dev* dev) {
 		dev->geo.start
 	);
 
-	seekread(dev->fd, 0, &m, sizeof(m));
-	if(m.signature == 0xaa55) {
+	if(dev->m.signature == 0xaa55) {
 		fprintf(stderr,"mbr|uniq sig|code crc|unknown\n");
 		wprintf(L"mbr|%08x|%08x|%04x\n",
 			m.unique_sig,
@@ -700,7 +718,9 @@ void write_mbr(gpt_dev* dev) {
 	}
 	m.part[0].end = chstom(end);
 	m.signature = 0xaa55;
-	seekwrite(dev->fd, 0, &m, sizeof(m));
+
+	memcpy(&(dev->m), &m, MBR_SZ);
+	seekwrite(dev->fd, 0, &m, MBR_SZ);
 }
 
 void write_gpt(gpt_dev* dev) {
@@ -750,6 +770,7 @@ void write_gpt(gpt_dev* dev) {
 	}
 	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
 	seekwrite(dev->fd, 1 * dev->lbsz, &h, HDR_SZ);
+	memcpy(&(dev->hdr), &h, HDR_SZ);
 
 	h.crc = 0;
 	h.this_lba = dev->last_lba;
@@ -763,22 +784,34 @@ void write_gpt(gpt_dev* dev) {
 	}
 	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
 	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &h, HDR_SZ);
+	memcpy(&(dev->alt), &h, HDR_SZ);
 
 	fprintf(stderr, "wrote new GPT header and table\n");
 }
 
-void recalc_header(gpt_hdr* hdr) {
-	uint32_t calc_crc = 0;
+// recalculate headers and rewrite them
+void rewrite_headers(gpt_dev* dev) {
+	uint32_t calc_crc;
 
-	hdr->crc = 0;
-	calc_crc = crc32(0, hdr, HDR_SZ);
-	if(hdr->header_size > HDR_SZ) {
-		calc_crc = crc32_zero(calc_crc, hdr->header_size - HDR_SZ);
+	dev->hdr.crc = 0;
+	calc_crc = crc32(0, &(dev->hdr), HDR_SZ);
+	if(dev->hdr.header_size > HDR_SZ) {
+		calc_crc = crc32_zero(calc_crc, dev->hdr.header_size - HDR_SZ);
 	}
-	hdr->crc = calc_crc;
+	dev->hdr.crc = calc_crc;
+
+	dev->alt.crc = 0;
+	calc_crc = crc32(0, &(dev->alt), HDR_SZ);
+	if(dev->alt.header_size > HDR_SZ) {
+		calc_crc = crc32_zero(calc_crc, dev->alt.header_size - HDR_SZ);
+	}
+	dev->alt.crc = calc_crc;
+
+	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
 }
 
-void recalc_ptable(gpt_dev* dev) {
+uint32_t calc_ptable(gpt_dev* dev) {
 	uint32_t calc_crc = 0;
 	part_entry part;
 
@@ -790,41 +823,31 @@ void recalc_ptable(gpt_dev* dev) {
 			calc_crc = crc32_zero(calc_crc, dev->hdr.entry_size- PART_SZ);
 		}
 	}
-	dev->hdr.ptable_crc = calc_crc;
+	return calc_crc;
 }
 
 void relabel_gpt(gpt_dev* dev) {
-	gpt_hdr alt;
-
-	// need a valid table to start
-	if(validate_device(dev) != 0) { return; }
-	seekread(dev->fd, dev->last_lba * dev->lbsz, &alt, HDR_SZ);
+	ensure_valid(dev);
 
 	if(not_zero(dev->id, 16)) {
 		memcpy(dev->hdr.disk_guid, dev->id, 16);
 	} else {
 		gen_guid4(dev->hdr.disk_guid);
 	}
-	memcpy(alt.disk_guid, dev->hdr.disk_guid, 16);
+	memcpy(dev->alt.disk_guid, dev->hdr.disk_guid, 16);
 
-	recalc_header(&(dev->hdr));
-	recalc_header(&alt);
-
-	seekwrite(dev->fd, 1 * dev->lbsz, &(dev->hdr), HDR_SZ);
-	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &alt, HDR_SZ);
+	rewrite_headers(dev);
 }
 
 void set_entry(gpt_dev* dev, char* argv[]) {
 	uint32_t num;
 	part_entry part;
-	gpt_hdr alt;
 
 	for(int i = 0; i < 8; i++) {
 		if(argv[i] == NULL) { fail("not enough arguments for set!"); }
 	}
 	
-	if(validate_device(dev) != 0) { return; }
-	seekread(dev->fd, dev->last_lba * dev->lbsz, &alt, HDR_SZ);
+	ensure_valid(dev);
 	
 	num = strtol(argv[0], NULL, 10);
 	num = num - 1;
@@ -867,15 +890,10 @@ void set_entry(gpt_dev* dev, char* argv[]) {
 	localtoc16(argv[7], part.name, PARTNAME_CHARS);
 
 	seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
-	seekwrite(dev->fd, (alt.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
+	seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &part, PART_SZ);
 	
-	recalc_ptable(dev);
-	alt.ptable_crc = dev->hdr.ptable_crc;
-	recalc_header(&(dev->hdr));
-	recalc_header(&alt);
-
-	seekwrite(dev->fd, 1 * dev->lbsz, &(dev->hdr), HDR_SZ);
-	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &alt, HDR_SZ);
+	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev);
+	rewrite_headers(dev);
 
 	fprintf(stderr, "wrote partition entry %u\n", num+1);
 }
@@ -912,7 +930,7 @@ void usage() {
 		"-p         Print\n"
 		"-m         Build and write a new protective MBR\n"
 		"-g         Build and write new blank GPT table (wipes all partitions!)\n"
-		"-r         Re-label an existing table with -U UUID, or a new random one if not provided.\n"
+		"-r         Relabel an existing table with -U UUID, or a new random one if not provided.\n"
 		"-s NUM PARTID START END TYPEID TYPEATTR CMNATTR LABEL\n"
 		"           Set NUM partition entry. PARTID may be '-' to generate. Bits in ATTR may be '-' to skip existing flags.\n"
 		"\n"
