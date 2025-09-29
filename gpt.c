@@ -117,6 +117,12 @@ typedef struct __attribute__((__packed__)) {
 } part_entry;
 _Static_assert(sizeof(part_entry) == PART_SZ, "bad part_entry size!");
 
+// meta part entry
+typedef struct {
+	uint32_t index;
+	part_entry e;
+} mpart;
+
 typedef struct {
 	char device[PATH_MAX];
 	int fd;
@@ -127,6 +133,7 @@ typedef struct {
 	gpt_hdr hdr;
 	gpt_hdr alt;
 	int is_valid_gpt;
+	int sane_parts;
 	int max_size_digits;
 	int part_entries;
 	int padding[4];
@@ -134,6 +141,7 @@ typedef struct {
 	uint32_t hdr_sz;
 	uint32_t part_sz;
 	uint8_t id[16];
+	mpart* parts;
 } gpt_dev;
 
 #define str(token) #token
@@ -162,6 +170,15 @@ mbr_chs chstom(chs c) {
 	r.ch_sector = c.sector | (c.cylinder>>8);
 	r.cl = c.cylinder & 0b11111111;
 	return r;
+}
+
+int cmp_start(const void* a_in, const void* b_in) {
+	const mpart* a = a_in;
+	const mpart* b = b_in;
+
+	if(a->e.start_lba < b->e.start_lba) { return -1; }
+	if(a->e.start_lba > b->e.start_lba) { return 1; }
+	return 0;
 }
 
 void bitstring(uint64_t in, int bits, char* out) {
@@ -267,7 +284,7 @@ void parse_uuid(char* in, uint8_t* dst) {
 }
 
 int not_zero(uint8_t* buf, size_t sz) {
-	for(size_t i = 0; i< sz; i++) {
+	for(size_t i = 0; i < sz; i++) {
 		if(buf[i] != 0) {
 			return 1;
 		}
@@ -286,45 +303,75 @@ void gen_guid4(uint8_t* dst) {
 	dst[8] = dst[8] & 0x3f | 0x80;
 }
 
+void safeseek(int fd, off_t offset) {
+	if(lseek(fd, offset, SEEK_SET) == -1) {
+		perror("");
+		fail("seek failure!");
+	}
+}
+
+void saferead(int fd, void* buf, size_t count) {
+	if(read(fd, buf, count) != count) {
+		perror("");
+		fail("read failure!");
+	}
+}
+
+void safewrite(int fd, void* buf, size_t count) {
+	if(write(fd, buf, count) != count) {
+		perror("");
+		fail("write failure!");
+	}
+}
+
 void seekread(int fd, off_t offset, void* buf, size_t count) {
-	if(lseek(fd, offset, SEEK_SET) == -1) { fail("seek"); }
-	if(read(fd, buf, count) != count) { fail("read"); }
+	safeseek(fd, offset);
+	saferead(fd, buf, count);
+}
+
+// if not zero return -1
+int read_zero(int fd, size_t count) {
+	uint8_t buf[BLOCK_SZ] = {0};
+
+	while(count > BLOCK_SZ) {
+		count = count - BLOCK_SZ;
+		saferead(fd, buf, BLOCK_SZ);
+		if(not_zero(buf, BLOCK_SZ)) { return -1; }
+	}
+	if(count) {
+		saferead(fd, buf, count);
+		if(not_zero(buf, count)) { return -1; }
+	}
+
+	return 0;
 }
 
 // if not zero return -1
 int seekread_zero(int fd, off_t offset, size_t count) {
-	uint8_t buf[BLOCK_SZ] = {0};
-
-	if(lseek(fd, offset, SEEK_SET) == -1) { fail("seek"); }
-	while(count > BLOCK_SZ) {
-		count = count - BLOCK_SZ;
-		if(read(fd, buf, BLOCK_SZ) != BLOCK_SZ) { perror(""); fail("read"); }
-		if(not_zero(buf, BLOCK_SZ)) { return -1; }
-	}
-	if(count) {
-		if(read(fd, buf, count) != count) { perror(""); fail("read"); }
-		if(not_zero(buf, count)) { return -1; }
-	}
-	
-	return 0;
+	safeseek(fd, offset);
+	return read_zero(fd, count);
 }
 
 void seekwrite(int fd, off_t offset, void* buf, size_t count) {
-	if(lseek(fd, offset, SEEK_SET) == -1) { fail("seek"); }
+	safeseek(fd, offset);
 	if(write(fd, buf, count) != count) { perror(""); fail("write"); }
 }
 
-void seekwrite_zero(int fd, off_t offset, size_t count) {
+void write_zero(int fd, size_t count) {
 	uint8_t buf[BLOCK_SZ] = {0};
 
-	if(lseek(fd, offset, SEEK_SET) == -1) { fail("seek"); }
 	while(count > BLOCK_SZ) {
 		count = count - BLOCK_SZ;
-		if(write(fd, buf, BLOCK_SZ) != BLOCK_SZ) { perror(""); fail("write"); }
+		safewrite(fd, buf, BLOCK_SZ);
 	}
 	if(count) {
-		if(write(fd, buf, count) != count) { perror(""); fail("write"); }
+		safewrite(fd, buf, count);
 	}
+}
+
+void seekwrite_zero(int fd, off_t offset, size_t count) {
+	safeseek(fd, offset);
+	write_zero(fd, count);
 }
 
 void c16tolocal(char16_t* in, char* out) {
@@ -368,17 +415,20 @@ void localtoc16(char* in, char16_t* out, size_t len) {
 	if(mbrtoc16(out, in, 1, &ps) == -1) { fail("could not parse label!"); }
 }
 
+#define VALID_GPT 0
 #define NOT_GPT -1
 #define UNEXPECTED -2
 #define CORRUPT -3
 #define CORRUPT_PTABLE -4
 #define CORRUPT_BACKUP -5
+#define UNCHECKED -6
 
 int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 	uint32_t reported_crc;
 	uint32_t calc_crc;
 	part_entry part;
-	int len;
+	uint64_t last_table_lba;
+	uint32_t part_index = 0;
 	
 	if(strncmp("EFI PART", hdr->signature, 8) != 0) { return NOT_GPT; }
 	wr(hdr->header_size < HDR_SZ || hdr->header_size > dev->lbsz, "illegal header size!", UNEXPECTED);
@@ -402,22 +452,51 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 		return UNEXPECTED;
 	}
 
+	last_table_lba = hdr->ptable_lba + (((hdr->ptable_entries * hdr->entry_size) + dev->lbsz - 1) / dev->lbsz) - 1;
+	wr(hdr->ptable_lba <= 1, "ptable inside primary header!", UNEXPECTED);
+	wr(last_table_lba >= dev->last_lba, "ptable runs into backup header!", UNEXPECTED);
+	wr(hdr->ptable_lba <= hdr->last_lba && hdr->ptable_lba >= hdr->first_lba, "ptable start inside partition space!", UNEXPECTED);
+	wr(last_table_lba <= hdr->last_lba && last_table_lba >= hdr->first_lba, "ptable end inside partition space!", UNEXPECTED);
+
+	// we need to iterate all partitions anyway, might as well record them into memory to avoid re-reading them
+	if(lba != 1) {
+		// dev->part_entries is assigned in the lba==1 pass
+		// should be the real amount of actual entries
+		dev->parts = malloc(dev->part_entries * sizeof(mpart));
+	}
+
 	calc_crc = 0;
+	// partition entries are all contiguous, so seek once and just continue reading
+	safeseek(dev->fd, hdr->ptable_lba * dev->lbsz);
 	for(int i = 0; i < hdr->ptable_entries; i++) {
-		seekread(dev->fd, (hdr->ptable_lba * dev->lbsz) + (i * hdr->entry_size), &part, sizeof(part));
-		wr((part.attr & 0b0000000000000000111111111111111111111111111111111111111111111000)!= 0, "unexpected partition attributes in reserved field!", UNEXPECTED);
+		saferead(dev->fd, &part, PART_SZ);
+		wr((part.attr & 0b0000000000000000111111111111111111111111111111111111111111111000)!= 0,
+		"unexpected partition attributes in reserved field!", UNEXPECTED);
 		calc_crc = crc32(calc_crc, &part, PART_SZ);
-		if(not_zero(part.type, 16)) {
-			dev->part_entries++;
-		}
 		// each entry may be bigger than 128, but the extra space *must* be zeroed
 		if(hdr->entry_size > PART_SZ) {
 			calc_crc = crc32_zero(calc_crc, hdr->entry_size - PART_SZ);
-			wr(seekread_zero(dev->fd,
-				(hdr->ptable_lba * dev->lbsz) + 
-				(i * hdr->entry_size) + PART_SZ,
-				hdr->entry_size - PART_SZ) != 0,
-			"reserved part of part entry not zero!", UNEXPECTED);
+			wr(read_zero(dev->fd, hdr->entry_size - PART_SZ) != 0, "reserved portion of part entry not zero!", UNEXPECTED);
+		}
+
+		// while we are here take some metrics and copy table into memory
+		if(not_zero(part.type, 16)) {
+			// first pass on primary, just count how many entries there actually are
+			if(lba == 1) {
+				dev->part_entries++;
+			} else if(part_index < dev->part_entries) {
+				// second pass on alt record them into memory
+				dev->parts[part_index].index = i;
+				memcpy(&(dev->parts[part_index].e), &part, PART_SZ);
+				part_index++;
+			} else {
+				warn("different partitions in primary versus backup table!");
+				return UNEXPECTED;
+			}
+		// if not a real entry verify the entire entry is zero
+		} else if(not_zero((uint8_t*)&part, PART_SZ)){
+			warn("populated fields found in blank entry!");
+			return UNEXPECTED;
 		}
 	}
 	wr(calc_crc != hdr->ptable_crc, "corrupted partition table!", CORRUPT_PTABLE);
@@ -427,11 +506,41 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 	return 0;
 }
 
+int check_overlap(gpt_dev* dev) {
+	uint64_t last_taken = 0;
+	qsort(dev->parts, dev->part_entries, sizeof(mpart), cmp_start);
+
+	for(uint32_t i = 0; i < dev->part_entries; i++) {
+		if(dev->parts[i].e.start_lba > dev->parts[i].e.end_lba) {
+			warn("insane range detected in partition %u!", dev->parts[i].index + 1);
+			return -1;
+		}
+		if(dev->parts[i].e.start_lba < dev->hdr.first_lba) {
+			warn("partition %u overlaps primary ptable and header area!", dev->parts[i].index + 1);
+			return -1;
+		}
+		if(dev->parts[i].e.end_lba > dev->hdr.last_lba) {
+			warn("partition %u overlaps backup ptable and header area!", dev->parts[i].index + 1);
+			return -1;
+		}
+		if(dev->parts[i].e.start_lba <= last_taken) {
+			warn("partition %u overlaps another partition!", dev->parts[i].index + 1);
+			return -1;
+		}
+
+		last_taken = dev->parts[i].e.end_lba;
+	}
+
+	dev->sane_parts = 1;
+	return 0;
+}
+
 // populate hdr and validate the device is actually GPT
 int check_device(gpt_dev* dev) {
 	int primary_ret;
 	int alt_ret;
 	uint32_t calc_crc;
+
 
 	primary_ret = validate_header(&(dev->hdr), dev, 1);
 	alt_ret = validate_header(&(dev->alt), dev, dev->last_lba);
@@ -452,28 +561,17 @@ int check_device(gpt_dev* dev) {
 		return primary_ret;
 	}
 
-	wr(dev->hdr.this_lba != 1, "unexpected lba address in primary", UNEXPECTED);
 	wr(dev->hdr.alt_lba != dev->last_lba, "unexpected alt lba address in primary", UNEXPECTED);
-	wr(dev->alt.this_lba != dev->hdr.alt_lba, "unexpected lba address in alt", UNEXPECTED);
+	wr(dev->alt.alt_lba != 1, "unexpected alt lba address in alt", UNEXPECTED);
 	wr(dev->alt.ptable_crc != dev->hdr.ptable_crc, "backup table has different contents!", UNEXPECTED);
-
-	// TODO: verify table doesn't run over partition space or last header
-	wr(dev->hdr.ptable_lba <= 1 || dev->hdr.ptable_lba >= dev->hdr.first_lba, "bad ptable address in primary!", UNEXPECTED);
-	wr(dev->alt.ptable_lba >= dev->last_lba || dev->alt.ptable_lba <= dev->alt.last_lba, "bad ptable address in backup!", UNEXPECTED);
 	wr(memcmp(dev->hdr.disk_guid, dev->alt.disk_guid, 16) != 0, "backup header has different identifier!", UNEXPECTED);
 	
-	dev->is_valid_gpt = 1;
-	return 0;
-}
-
-void ensure_valid(gpt_dev* dev) {
-	if(dev->is_valid_gpt == 0) {
-		check_device(dev);
+	// Check for insane ranges but just warn so they can use tools to fix 
+	if(check_overlap(dev) != 0) {
+		warn("Insane partition ranges detected! You should really fix this!");
 	}
 
-	if(dev->is_valid_gpt == 0) {
-		fail("not a valid gpt device! need to fix first!");
-	}
+	return VALID_GPT;
 }
 
 int open_device(char* device, gpt_dev* dev, int rflag)  {
@@ -497,13 +595,18 @@ int open_device(char* device, gpt_dev* dev, int rflag)  {
 	dev->last_lba = (size_bytes / dev->lbsz) - 1;
 	dev->max_size_digits = digits(dev->last_lba);
 
-	dev->max_entries = 128; // default
+	// initialize defaults for dev struct
+	dev->max_entries = 128; 
+	dev->is_valid_gpt = UNCHECKED;
+	dev->sane_parts = 0;
+	dev->part_entries = 0;
+	dev->parts = NULL;
 
 	strcpy(dev->device, device);
 
 	// read entire mbr, primary gpt header, and backup gpt header
-	// partitions are read and checked on the fly
 	// none of these are necessarily valid at this point though
+	// partitions are read into memory during validation
 	seekread(dev->fd, 0, &(dev->m), MBR_SZ);
 	seekread(dev->fd, (1 * dev->lbsz), &(dev->hdr), HDR_SZ);
 	seekread(dev->fd, (dev->last_lba * dev->lbsz), &(dev->alt), HDR_SZ);
@@ -511,27 +614,20 @@ int open_device(char* device, gpt_dev* dev, int rflag)  {
 	return 0;
 }
 
-// callback for each non-empty partition entry
-void iterate_part(gpt_dev* dev, void (*on_part)(gpt_dev* dev, int num, part_entry* part)) {
-	part_entry part;
-
-	for(int part_num = 0; part_num < dev->hdr.ptable_entries; part_num++) {
-		seekread(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (part_num * dev->hdr.entry_size), &part, sizeof(part));
-		// if type id is not all zeroes trigger on_part
-		if(not_zero(part.type, sizeof(part.type))) {
-			on_part(dev, part_num + 1, &part);
-		}
+void close_device(gpt_dev* dev) {
+	close(dev->fd);
+	if(dev->parts != NULL) {
+		free(dev->parts);
 	}
 }
 
 int validate_device(gpt_dev* dev) {
-	int ret;
-	ret = check_device(dev);
-	switch(ret) {
+	dev->is_valid_gpt = check_device(dev);
+	switch(dev->is_valid_gpt) {
 		case 0:
 			break;
 		case NOT_GPT:
-			warn("%s does not have gpt table.", dev->device);
+			warn("%s does not have a gpt table.", dev->device);
 			break;
 		case UNEXPECTED:
 			warn("An unexpected problem occurred validating the partition table on %s.\n"
@@ -545,10 +641,23 @@ int validate_device(gpt_dev* dev) {
 				"You may need to restore the backup table. Or start a new table.", dev->device);
 			break;
 	}
-	return ret;
+	return dev->is_valid_gpt;
 }
 
-void print_part(gpt_dev* dev, int num, part_entry* part) {
+void ensure_checked(gpt_dev* dev) {
+	if(dev->is_valid_gpt == UNCHECKED) {
+		validate_device(dev);
+	}
+}
+
+void ensure_valid(gpt_dev* dev) {
+	ensure_checked(dev);
+	if(dev->is_valid_gpt != VALID_GPT) {
+		fail("not a valid gpt device! need to fix first!");
+	}
+}
+
+void print_part(gpt_dev* dev, uint32_t num, part_entry* part) {
 	char type_uuid[UUID_STR_SZ];
 	char id_uuid[UUID_STR_SZ];
 	// just account for maximum possible length of localized string
@@ -574,6 +683,15 @@ void print_part(gpt_dev* dev, int num, part_entry* part) {
 	);
 }
 
+void print_free(gpt_dev* dev, uint32_t num, uint64_t start, uint64_t end) {
+	// num uuid start end
+	wprintf(L"%03d|free_space                          |%0*lu|%0*lu\n",
+		num,
+		dev->max_size_digits,start,
+		dev->max_size_digits,end
+	);
+}
+
 void print_device(gpt_dev* dev) {
 	int ret;
 	chs start;
@@ -586,6 +704,7 @@ void print_device(gpt_dev* dev) {
 	} else {
 		fprintf(stderr, "\n");
 	}
+	// TODO: num start end first for all things
 
 	fprintf(stderr,
 		"dsk|%-*s|lbsz|%-*s|hpc|spt|cyls |start sector\n",
@@ -628,7 +747,8 @@ void print_device(gpt_dev* dev) {
 		}
 	}
 
-	if(validate_device(dev) != 0) { return; }
+	ensure_checked(dev);
+	if(dev->is_valid_gpt != VALID_GPT) { return; }
 
 	uuid_str(uuid, dev->hdr.disk_guid);
 	fprintf(stderr,
@@ -642,14 +762,29 @@ void print_device(gpt_dev* dev) {
 		dev->max_size_digits, dev->hdr.first_lba, dev->max_size_digits,dev->hdr.last_lba,
 		dev->hdr.ptable_entries
 	);
-	
+
 	if(dev->part_entries) {
 		// num uuid start end common-attr type type-attr label
 		fprintf(stderr, "num|%-36s|%-*s|%-*s|%-36s|type attributes |cmn|label\n",
 			"partuuid",
 			dev->max_size_digits,"start", dev->max_size_digits,"end", "type"
 		);
-		iterate_part(dev, print_part);
+		
+		uint64_t chkfree = dev->hdr.first_lba;
+		uint32_t freenum = 1;
+		// TODO: print free space
+		for(uint32_t i = 0; i < dev->part_entries; i++) {
+			if(dev->sane_parts) {
+				if(!(chkfree >= dev->parts[i].e.start_lba && chkfree <= dev->parts[i].e.end_lba)) {
+					print_free(dev, freenum++, chkfree, dev->parts[i].e.start_lba - 1);
+				}
+				chkfree = dev->parts[i].e.end_lba + 1;
+			}
+			print_part(dev, dev->parts[i].index+1, &dev->parts[i].e);
+		}
+		if(dev->sane_parts && chkfree <= dev->hdr.last_lba) {
+			print_free(dev, freenum, chkfree, dev->hdr.last_lba);
+		}
 	}
 }
 
@@ -676,12 +811,12 @@ void print_devices() {
 				if(open_device(path, &dev, O_RDONLY) != 0) {
 					continue;
 				}
+				validate_device(&dev);
 				print_device(&dev);
-				close(dev.fd);
+				close_device(&dev);
 			}
 		}
 	}
-	fclose(parts);
 }
 
 void write_mbr(gpt_dev* dev) {
@@ -726,6 +861,7 @@ void calc_hdr(gpt_hdr* hdr) {
 }
 
 // recalculate ptable crc and return the value
+// TODO: do this in memory now
 uint32_t calc_ptable(gpt_dev* dev, gpt_hdr* hdr) {
 	uint32_t calc_crc = 0;
 	part_entry part;
@@ -759,6 +895,7 @@ void restore_primary(gpt_dev* dev) {
 	}
 	calc_hdr(&(dev->hdr));
 
+	// TODO: work from memory
 	for(int i = 0; i < dev->alt.ptable_entries; i++) {
 		seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (i * dev->alt.entry_size), &part, PART_SZ);
 		seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (i * dev->hdr.entry_size), &part, PART_SZ);
@@ -786,6 +923,7 @@ void restore_backup(gpt_dev* dev) {
 	}
 	calc_hdr(&(dev->alt));
 
+	// TODO: work from memory
 	for(int i = 0; i < dev->hdr.ptable_entries; i++) {
 		seekread(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (i * dev->hdr.entry_size), &part, PART_SZ);
 		seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (i * dev->alt.entry_size), &part, PART_SZ);
@@ -839,6 +977,7 @@ void write_gpt(gpt_dev* dev) {
 	calc_hdr(&h);
 	memcpy(&(dev->alt), &h, HDR_SZ);
 
+	// TODO: wipe memory ptable
 	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
 	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &h, HDR_SZ);
 
@@ -864,55 +1003,98 @@ void relabel_gpt(gpt_dev* dev) {
 	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
 }
 
-void set_entry(gpt_dev* dev, char* argv[]) {
-	uint32_t num;
+void set_entry(gpt_dev* dev, uint32_t num,
+	char* partid, char* start, char* end, char* typeid, char* typeattr, char* cmnattr, char* label) {
 	part_entry part;
-
-	for(int i = 0; i < 8; i++) {
-		if(argv[i] == NULL) { fail("not enough arguments for set!"); }
-	}
+	uint64_t start_lba;
+	uint64_t end_lba;
 	
 	ensure_valid(dev);
 	
-	num = strtol(argv[0], NULL, 10) - 1;
-	if(num > dev->hdr.ptable_entries) { fail("entry does not exist!"); }
-	seekread(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
+	if(num < 1 || num >= dev->alt.ptable_entries) { fail("entry does not exist!"); }
+	// zero index
+	num = num - 1;
+
+	// try to default start and end based on prev and next entries or just the start and end of the disk
+	if(start == NULL || start[0] == '-') {
+		start_lba = dev->alt.first_lba;
+		if(num >= 1) {
+			seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + ((num-1) * dev->alt.entry_size), &part, PART_SZ);
+			if(not_zero(part.type, 16)) {
+				start_lba = part.end_lba + 1;
+			}
+		}
+	} else {
+		start_lba = strtol(start, NULL, 10);
+	}
+	if(end == NULL || end[0] == '-') {
+		end_lba = dev->alt.last_lba;
+		if(num <= dev->alt.ptable_entries-2) {
+			seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + ((num+1) * dev->alt.entry_size), &part, PART_SZ);
+			if(not_zero(part.type, 16)) {
+				end_lba = part.start_lba - 1;
+			}
+		}
+	} else {
+		end_lba = strtol(end, NULL, 10);
+	}
+
+	if(start_lba < dev->alt.first_lba || start_lba > dev->alt.last_lba ) { fail("invalid start lba"); }
+	if(end_lba < dev->alt.first_lba || end_lba > dev->alt.last_lba ) {  fail("invalid end lba"); }
+	seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &part, PART_SZ);
 	
-	if(argv[1][0] == '-') {
+	part.start_lba = start_lba;
+	part.end_lba = end_lba;
+	
+	// if '+' generate always
+	// if NULL generate only if not existing
+	// if '-' generate only if not existing
+	// if provided use provded
+	if(partid != NULL && partid[0] == '+') {
+		gen_guid4(part.id);
+	} else if(partid == NULL || partid[0] == '-') {
 		if(!not_zero(part.id, 16)) {
 			gen_guid4(part.id);
 		}
 	} else {
-		parse_uuid(argv[1], part.id);
+		parse_uuid(partid, part.id);
 	}
 
-	part.start_lba = strtol(argv[2], NULL, 10);
-	if(part.start_lba < dev->hdr.first_lba) { fail("start too early!"); }
-	part.end_lba = strtol(argv[3], NULL, 10);
-	if(part.end_lba < part.start_lba) { fail("end too early!"); }
-	if(part.end_lba > dev->hdr.last_lba) { fail("end too late!"); }
+	if(typeid != NULL && typeid[0] != '-') {
+		parse_uuid(typeid, part.type);
+	} else if(!not_zero(part.type, 16)) {
+		// linux-generic type as default. technically this parse is a small but avoidable performance hit. TODO maybe.
+		parse_uuid("0fc63daf-8483-4772-8e79-3d69d8477de4", part.type);
+	}
 
-	if(argv[4][0] == '-') {
-		if(!not_zero(part.type, 16)) {
-			fail("new entry needs a type!");
+	if(typeattr != NULL) {
+		for(int i = 0; i < 16; i++) {
+			if(typeattr[i] == 0) { break; }
+			if(typeattr[i] == '-') { continue; }
+			if(typeattr[i] == '+') {
+				setbit(part.attr, (15-i) + 48, !getbit(part.attr, (15-i)));
+			} else {
+				setbit(part.attr, (15-i) + 48, typeattr[i] == '1');
+			}
 		}
-	} else {
-		parse_uuid(argv[4], part.type);
+	}
+	if(cmnattr != NULL) {
+		for(int i = 0; i < 3; i++) {
+			if(cmnattr[i] == 0) { break; }
+			if(cmnattr[i] == '-') { continue; }
+			if(cmnattr[i] == '+') {
+				setbit(part.attr, (2-i), !getbit(part.attr, (2-i)));
+			} else {
+				setbit(part.attr, (2-i), cmnattr[i] == '1');
+			}
+		}
 	}
 
-	for(int i = 0; i < 16; i++) {
-		if(argv[5][i] == 0) { break; }
-		if(argv[5][i] == '-') { continue; }
-		setbit(part.attr, (15-i) + 48, argv[5][i] == '1');
-	}
-	for(int i = 0; i < 3; i++) {
-		if(argv[6][i] == 0) { break; }
-		if(argv[6][i] == '-') { continue; }
-		setbit(part.attr, (2-i), argv[6][i] == '1');
+	if(label != NULL) {
+		localtoc16(label, part.name, PARTNAME_CHARS);
 	}
 
-	localtoc16(argv[7], part.name, PARTNAME_CHARS);
-
+	// TODO: memory ptable
 	// write to backup first, then the primary
 	seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &part, PART_SZ);
 	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev, &(dev->alt));
@@ -930,6 +1112,7 @@ void del_entry(gpt_dev* dev, uint32_t num) {
 
 	num = num - 1;
 
+	// TODO: memory ptable
 	// write to backup first, then the primary
 	seekwrite_zero(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), PART_SZ);
 	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev, &(dev->alt));
@@ -940,6 +1123,19 @@ void del_entry(gpt_dev* dev, uint32_t num) {
 	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
 
 	fprintf(stderr, "deleted partition entry %u\n", num + 1);
+}
+
+// TODO: do the thing
+void move_entry(gpt_dev* dev, uint32_t a, uint32_t b) {
+	part_entry part;
+
+	ensure_valid(dev);
+	a = a - 1;
+	b = b - 1;
+	//seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &part, PART_SZ);
+
+
+	fprintf(stderr, "moved partition entry %u to %u\n", a+1, b+1);
 }
 
 void usage() {
@@ -953,33 +1149,47 @@ void usage() {
 		"COMMANDS are processed in the order given. Will print if none provided.\n"
 		"\n"
 		"WARNING: This is a raw editing tool primarily to be used by scripts.\n"
-		"Most commands are performed with no sanity checks or confirmations.\n"
+		"Commands are performed with no confirmations and without many sanity checks.\n"
 		"\n"
 		"COMMANDS:\n"
-		"-L LBSZ    Override logical block size (normally reported or 512)\n"
-		"           useful if DEVICE is a file\n"
-		"-B BLOCK   Override last block of DEVICE (total size in blocks - 1)\n"
+		"-L LBSZ    Override logical block size (normally as reported or 512)\n"
+		"           useful if DEVICE is a file.\n"
+		"-B BLOCK   Override last block of DEVICE (total size in blocks - 1) where backup header lives.\n"
 		"-G HPC SPT Override geometry: heads per cylinder(255), sectors per track(63)\n"
-		"           used in building protective MBR\n"
-		"-N MAX     Use MAX entries when building(-g) or rebuilding(-r) a GPT table. Defaults to 128.\n"
-		"           Each entry is 128 bytes. Be careful the table itself won't overlap the first partition.\n"
-		"           Typically 128*128/512 is 32 contiguous blocks. Past MBR and GPT header the first available is lba 34.\n"
-		"           Assuming p1 start==1MiB,lbsz==512 you could have (1048576-(512*2))/128==8184 entries.\n"
-		"-U UUID    Use specific UUID when building(-g) or rebuilding(-r) a GPT table."
-		"-P A B C D Add padding around part tables(in number of blocks) when building GPT table (-g).\n"
-		"           before primary table (after lba 1), after primary table,\n"
+		"           used in building protective MBR (-b).\n"
+		"-N MAX     Use MAX entries when building a GPT table (-g). Defaults to 128.\n"
+		"           Each entry is 128 bytes(w/o -R). Given 1MiB of space at each end, up to ~8k MAX is reasonable.\n"
+		"           For example if LBSZ is 8192 then (1048576-(8192*2))/128==8064.\n"
+		"-U UUID    Use specific disk UUID when building(-g) or relabeling(-r) a GPT table.\n"
+		"-P A B C D Add padding around part tables(in blocks) when building or restoring GPT table (-g, -f, -l).\n"
+		"           before primary table (after lba 1 header), after primary table,\n"
 		"           before backup table, after backup table(before last header).\n"
+		"           This option has little practical use and is generally not recommended to use.\n"
 		"-R H P     Use custom header and part entry sizing when building a GPT table (-g).\n"
-		"           H<=lbsz. P must be a power of 2 and >128. The extra reserved space must be zero.\n"
+		"           92<=H<=lbsz. P must be a power of 2 and >=128. The extra space must be zero.\n"
+		"           This option has almost no practical use and is generally not recommended to use.\n"
+		"\n"
 		"-p         Print\n"
-		"-m         Build and write a new protective MBR\n"
+		"-b         Build and write a new protective MBR\n"
 		"-g         Build and write new blank GPT table (wipes all partitions!)\n"
 		"-r         Relabel an existing table with -U UUID, or a new random one if not provided.\n"
-		"-f         Restore the primary table from the backup table (-P before will be used).\n"
-		"-l         Restore the backup table from the primary table (-P before will be used).\n"
-		"-s NUM PARTID START END TYPEID TYPEATTR CMNATTR LABEL\n"
-		"           Set NUM partition entry. PARTID may be '-' to generate. Bits in ATTR may be '-' to skip existing flags.\n"
+		"-f         Restore the primary table from the backup table (-P before padding can be used).\n"
+		"-l         Restore the backup table from the primary table (-P before padding can be used).\n"
+		"\n"
+		"-s NUM p=PARTID s=START e=END t=TYPEID a=TYPEATTR c=CMNATTR l=LABEL\n"
+		"           Set NUM partition entry fields. Skipped fields use existing, default, or generated values.\n"
+		"           PARTID will be generated if not provided and not existing. A '+' forces generation.\n"
+		"           START and END are in blocks and are both inclusive.\n"
+		"           Defaults will use available space based on previous end and next start entries.\n"
+		"           (If the the table is not sorted, this may be incorrect!)\n"
+		"           TYPEID defaults to 0fc63daf-8483-4772-8e79-3d69d8477de4 (linux-generic).\n"
+		"           Bits in attr fields '-' skip over existing flags. '+' toggles existing flag.\n"
+		"           LABEL defaults to null. LABEL may be any UTF string representable in UTF-16.\n"
+		"           (Though you might want to avoid '/' for path compatibility)\n"
+		"-x NUM PARTID START END TYPEID TYPEATTR CMNATTR LABEL\n"
+		"           Alternative set(-s). A '-' can be used to skip all fields but label.\n"
 		"-d NUM     Delete a partition entry (set all its contents to zero).\n"
+		"-m A B     Move a partition entry from number A to number B.\n"
 		"\n"
 		, program_name, program_name);
 }
@@ -987,6 +1197,16 @@ void usage() {
 int main(int argc, char* argv[]) {
 	int cmd_processed = 0;
 	gpt_dev dev = {0};
+
+	uint64_t num;
+	char* partid;
+	char* start;
+	char* end;
+	char* typeid;
+	char* typeattr;
+	char* cmnattr;
+	char* label;
+	partid = start = end = typeid = typeattr = cmnattr = label = NULL;
 
 	// set locale to system default, so we can print "wide" characters with wprintf (for UTF-16 partition label)
 	// Once either printf or wprintf is used the other stops working for that stream
@@ -1079,7 +1299,7 @@ next_printopt:
 					cmd_processed = 1;
 					print_device(&dev);
 					break;
-				case 'm':
+				case 'b':
 					cmd_processed = 1;
 					write_mbr(&dev);
 					break;
@@ -1100,15 +1320,66 @@ next_printopt:
 					restore_backup(&dev);
 					break;
 				case 's':
+					if(argv[1] == NULL) { fail("need argument!"); }
 					cmd_processed = 1;
-					set_entry(&dev, argv+1);
+					num = strtol(argv[1], NULL, 10);
+					argv++;
+					partid = start = end = typeid = typeattr = cmnattr = label = NULL;
+					// parse 'a=b' options
+					while(argv[1] != NULL && argv[1][0] != 0 && argv[1][1] == '=') {
+						switch(argv[1][0]) {
+							case 'p':
+								partid = argv[1]+2;
+								break;
+							case 's':
+								start = argv[1]+2;
+								break;
+							case 'e':
+								end = argv[1]+2;
+								break;
+							case 't':
+								typeid = argv[1]+2;
+								break;
+							case 'a':
+								typeattr = argv[1]+2;
+								break;
+							case 'c':
+								cmnattr = argv[1]+2;
+								break;
+							case 'l':
+								label = argv[1]+2;
+								break;
+						}
+						argv++;
+					}
+					set_entry(&dev, num, partid, start, end, typeid, typeattr, cmnattr, label);
+					goto next_cmd;
+				case 'x':
+					if( argv[1] == NULL ||
+						argv[2] == NULL ||
+						argv[3] == NULL ||
+						argv[4] == NULL ||
+						argv[5] == NULL ||
+						argv[6] == NULL ||
+						argv[7] == NULL ||
+						argv[8] == NULL
+					) { fail("need arguments!"); }
+					cmd_processed = 1;
+					set_entry(&dev, strtol(argv[1], NULL, 10),
+						argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8]);
 					argv += 8;
 					goto next_cmd;
 				case 'd':
+					if(argv[1] == NULL) { fail("need argument!"); }
 					cmd_processed = 1;
 					del_entry(&dev, strtol(argv[1], NULL, 10));
 					argv += 1;
 					goto next_cmd;
+				case 'm':
+					if(argv[1] == NULL || argv[2] == NULL) { fail("need arguments!"); }
+					cmd_processed = 1;
+					move_entry(&dev, strtol(argv[1], NULL, 10), strtol(argv[2], NULL, 10));
+					argv += 2;
 				default:
 					usage();
 					return 1;
@@ -1120,9 +1391,10 @@ next_cmd:
 	}
 
 	if(!cmd_processed) {
+		validate_device(&dev);
 		print_device(&dev);
 	}
 
-	close(dev.fd);
+	close_device(&dev);
 	return 0;
 }
