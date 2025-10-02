@@ -1256,8 +1256,8 @@ void move_entry(gpt_dev* dev, uint32_t a, uint32_t b) {
 
 void usage() {
 	wprintf(L""
-		"%hs [-f]\n"
-		"%hs [DEVICE] [COMMANDS]\n"
+		"%s [-f]\n"
+		"%s [DEVICE] [COMMANDS]\n"
 		"\n"
 		"Print or modify contents of GPT partition tables.\n"
 		"\n"
