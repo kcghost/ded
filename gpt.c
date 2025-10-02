@@ -36,10 +36,14 @@
 #include <linux/fs.h>
 #include <linux/hdreg.h>
 
+#ifndef BLKGETDISKSEQ
+#define BLKGETDISKSEQ _IOR(0x12,128,__u64)
+#endif
+
 char* program_name = "gpt";
 int first_print = 1;
-// minimal size without extra reserved space (that must be zero in current spec)
 #define MBR_SZ 512
+// minimal size without extra reserved space (that must be zero in current spec)
 #define HDR_SZ  92
 #define PART_SZ 128
 // semi-arbitrary size for buffered read/write
@@ -52,6 +56,7 @@ int first_print = 1;
 #define getbit(in,bit) ((in >> bit) & 1)
 #define setbit(out,bit,val) out = (out & ~((typeof(out))1 << bit)) | ((typeof(out))(val) << bit)
 
+// the "real" mbr chs format is very awkward - use this struct then convert it
 typedef struct {
 	int head;
 	int sector;
@@ -129,12 +134,14 @@ typedef struct {
 	unsigned int lbsz;
 	uint64_t last_lba;
 	struct hd_geometry geo;
+	uint64_t disk_seq;
 	mbr m;
 	gpt_hdr hdr;
 	gpt_hdr alt;
 	int is_valid_gpt;
 	int sane_parts;
 	int max_size_digits;
+	int max_index_digits;
 	int part_entries;
 	int padding[4];
 	int max_entries;
@@ -171,16 +178,6 @@ mbr_chs chstom(chs c) {
 	r.cl = c.cylinder & 0b11111111;
 	return r;
 }
-
-int cmp_start(const void* a_in, const void* b_in) {
-	const mpart* a = a_in;
-	const mpart* b = b_in;
-
-	if(a->e.start_lba < b->e.start_lba) { return -1; }
-	if(a->e.start_lba > b->e.start_lba) { return 1; }
-	return 0;
-}
-
 void bitstring(uint64_t in, int bits, char* out) {
 	for(int i = 0; i < bits; i++) {
 		out[i] = getbit(in, bits-1-i) ? '1' : '0';
@@ -429,6 +426,7 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 	part_entry part;
 	uint64_t last_table_lba;
 	uint32_t part_index = 0;
+	uint32_t max_index = 0;
 	
 	if(strncmp("EFI PART", hdr->signature, 8) != 0) { return NOT_GPT; }
 	wr(hdr->header_size < HDR_SZ || hdr->header_size > dev->lbsz, "illegal header size!", UNEXPECTED);
@@ -462,7 +460,9 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 	if(lba != 1) {
 		// dev->part_entries is assigned in the lba==1 pass
 		// should be the real amount of actual entries
-		dev->parts = malloc(dev->part_entries * sizeof(mpart));
+		if(dev->part_entries) {
+			if((dev->parts = malloc(dev->part_entries * sizeof(mpart))) == NULL) { fail("memfail"); }
+		}
 	}
 
 	calc_crc = 0;
@@ -484,13 +484,17 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 			// first pass on primary, just count how many entries there actually are
 			if(lba == 1) {
 				dev->part_entries++;
+				if(i > max_index) {
+					max_index = i;
+					dev->max_index_digits = digits(max_index+2); // free space "index" may be up to 2 greater
+				}
 			} else if(part_index < dev->part_entries) {
 				// second pass on alt record them into memory
 				dev->parts[part_index].index = i;
 				memcpy(&(dev->parts[part_index].e), &part, PART_SZ);
 				part_index++;
 			} else {
-				warn("different partitions in primary versus backup table!");
+				warn("different amount of partitions in primary versus backup table!");
 				return UNEXPECTED;
 			}
 		// if not a real entry verify the entire entry is zero
@@ -506,13 +510,23 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 	return 0;
 }
 
+int cmp_start(const void* a_in, const void* b_in) {
+	const mpart* a = a_in;
+	const mpart* b = b_in;
+
+	if(a->e.start_lba < b->e.start_lba) { return -1; }
+	if(a->e.start_lba > b->e.start_lba) { return 1; }
+	return 0;
+}
+
 int check_overlap(gpt_dev* dev) {
 	uint64_t last_taken = 0;
+	// sort parts by starts on the disk
 	qsort(dev->parts, dev->part_entries, sizeof(mpart), cmp_start);
 
 	for(uint32_t i = 0; i < dev->part_entries; i++) {
 		if(dev->parts[i].e.start_lba > dev->parts[i].e.end_lba) {
-			warn("insane range detected in partition %u!", dev->parts[i].index + 1);
+			warn("start > end in partition %u!", dev->parts[i].index + 1);
 			return -1;
 		}
 		if(dev->parts[i].e.start_lba < dev->hdr.first_lba) {
@@ -541,6 +555,12 @@ int check_device(gpt_dev* dev) {
 	int alt_ret;
 	uint32_t calc_crc;
 
+	// reload ptable as a side effect
+	if(dev->parts != NULL) {
+		free(dev->parts);
+		dev->parts = NULL;
+	}
+	dev->part_entries = 0;
 
 	primary_ret = validate_header(&(dev->hdr), dev, 1);
 	alt_ret = validate_header(&(dev->alt), dev, dev->last_lba);
@@ -575,6 +595,7 @@ int check_device(gpt_dev* dev) {
 }
 
 int open_device(char* device, gpt_dev* dev, int rflag)  {
+	uint64_t disk_seq = 0;
 	uint64_t size_bytes;
 	wr((dev->fd = open(device, rflag)) == -1, "could not open device", -1);
 	if(ioctl(dev->fd, BLKSSZGET, &(dev->lbsz)) != 0) {
@@ -585,13 +606,16 @@ int open_device(char* device, gpt_dev* dev, int rflag)  {
 		// might just be a file rather than a block device
 		wr((size_bytes = lseek(dev->fd, 0, SEEK_END)) == -1, "could not get device size!", -1);
 	}
-
 	if(ioctl(dev->fd, HDIO_GETGEO, &(dev->geo)) != 0) {
 		warn("could not read geometry for %s, assuming traditional max values for hpc and spt", device);
 		dev->geo.heads = 255;
 		dev->geo.sectors = 63;
 	}
+	if(ioctl(dev->fd, BLKGETDISKSEQ, &disk_seq) != 0) {
+		warn("could not read disk seq, just defaulting to zero");
+	}
 
+	dev->disk_seq = disk_seq;
 	dev->last_lba = (size_bytes / dev->lbsz) - 1;
 	dev->max_size_digits = digits(dev->last_lba);
 
@@ -673,22 +697,24 @@ void print_part(gpt_dev* dev, uint32_t num, part_entry* part) {
 	bitstring(part->attr, 3, cmn_bits);
 
 	// num uuid start end type type-attr common-attr label
-	wprintf(L"%03d|%s|%0*lu|%0*lu|%s|%s|%s|%s\n",
-		num, id_uuid,
-		dev->max_size_digits,part->start_lba, dev->max_size_digits,part->end_lba,
+	wprintf(L"p|%03u|%0*lu|%0*lu|%s|%s|%s|%s|%s\n",
+		num,
+		dev->max_size_digits, part->start_lba,
+		dev->max_size_digits, part->end_lba,
 		type_uuid,
 		type_bits,
 		cmn_bits,
+		id_uuid,
 		name
 	);
 }
 
 void print_free(gpt_dev* dev, uint32_t num, uint64_t start, uint64_t end) {
-	// num uuid start end
-	wprintf(L"%03d|free_space                          |%0*lu|%0*lu\n",
+	// num start end
+	wprintf(L"f|%03u|%0*lu|%0*lu\n",
 		num,
-		dev->max_size_digits,start,
-		dev->max_size_digits,end
+		dev->max_size_digits, start,
+		dev->max_size_digits, end
 	);
 }
 
@@ -704,75 +730,80 @@ void print_device(gpt_dev* dev) {
 	} else {
 		fprintf(stderr, "\n");
 	}
-	// TODO: num start end first for all things
 
+	ensure_checked(dev);
+	if(dev->is_valid_gpt == VALID_GPT) {
+		uuid_str(uuid, dev->hdr.disk_guid);
+	}
+
+	// num range type attributes identifiers
 	fprintf(stderr,
-		"dsk|%-*s|lbsz|%-*s|hpc|spt|cyls |start sector\n",
-		(int)strlen(dev->device),"path",
-		dev->max_size_digits, "last lb"
+		"d|seq|%-*s|%-*s|%-*s|%-*s|lbsz|hpc|spt|cyls |boot crc|unkn|disksign|%-36s|path\n",
+		dev->max_size_digits, "fst avl",
+		dev->max_size_digits, "lst avl",
+		dev->max_size_digits, "last lb",
+		dev->is_valid_gpt == VALID_GPT ? digits(dev->hdr.ptable_entries) : 3, "max",
+		"diskuuid"
 	);
-	wprintf(L"dsk|%s|%04u|%0*u|%03u|%03u|%05u|%lu\n",
-		dev->device,
+	wprintf(L"d|%03lu|%0*lu|%0*lu|%0*lu|%u|%04u|%03u|%03u|%05u|%08x|%04x|%08x|%s|%s\n",
+		dev->disk_seq,
+		dev->max_size_digits, dev->is_valid_gpt == VALID_GPT ? dev->hdr.first_lba : 0,
+		dev->max_size_digits, dev->is_valid_gpt == VALID_GPT ? dev->hdr.last_lba : 0,
+		dev->max_size_digits, dev->last_lba,
+		dev->is_valid_gpt == VALID_GPT ? dev->hdr.ptable_entries : 0,
 		dev->lbsz,
-		dev->max_size_digits,dev->last_lba,
 		dev->geo.heads,
 		dev->geo.sectors,
 		dev->geo.cylinders,
-		dev->geo.start
+		crc32(0, dev->m.boot_code, sizeof(dev->m.boot_code)),
+		dev->m.unknown,
+		dev->m.unique_sig,
+		dev->is_valid_gpt == VALID_GPT ? uuid : "00000000-0000-0000-0000-000000000000",
+		dev->device
 	);
 
-	if(dev->m.signature == 0xaa55) {
-		fprintf(stderr,"mbr|uniq sig|code crc|unknown\n");
-		wprintf(L"mbr|%08x|%08x|%04x\n",
-			dev->m.unique_sig,
-			crc32(0, dev->m.boot_code, sizeof(dev->m.boot_code)),
-			dev->m.unknown
+	if(dev->m.signature == 0xaa55 && (
+			dev->m.part[0].type ||
+			dev->m.part[1].type ||
+			dev->m.part[2].type ||
+			dev->m.part[3].type
+		)) {
+		fprintf(stderr,"m|num|%-*s|%-*s|shd|ss|scyl|ehd|es|ecyl|os\n",
+			dev->max_size_digits, "start",
+			dev->max_size_digits, "size"
 		);
-		fprintf(stderr,"mN|os|start     |size      |shd|ss|scyl|ehd|es|ecyl\n");
 		for(int i = 0; i < 4; i++) {
+			if(dev->m.part[i].type == 0x00) { continue; }
 			start = mtochs(dev->m.part[i].start);
 			end = mtochs(dev->m.part[i].end);
-			wprintf(L"m%d|%02x|%010u|%010u|%03u|%02u|%04u|%03u|%02u|%04u\n",
-				i,
-				dev->m.part[i].type,
-				dev->m.part[i].start_lba,
-				dev->m.part[i].size_lba,
+			wprintf(L"m|%03u|%0*u|%0*u|%03u|%02u|%04u|%03u|%02u|%04u|%02x\n",
+				i + 1,
+				dev->max_size_digits, dev->m.part[i].start_lba,
+				dev->max_size_digits, dev->m.part[i].size_lba,
 				start.head,
 				start.sector,
 				start.cylinder,
 				end.head,
 				end.sector,
-				end.cylinder
+				end.cylinder,
+				dev->m.part[i].type
 			);
 		}
 	}
 
-	ensure_checked(dev);
-	if(dev->is_valid_gpt != VALID_GPT) { return; }
-
-	uuid_str(uuid, dev->hdr.disk_guid);
-	fprintf(stderr,
-		"gpt|%-36s|%-*s|%-*s|max entries\n",
-		"disk uuid",
-		dev->max_size_digits,"fst avl",
-		dev->max_size_digits,"lst avl"
-	);
-	wprintf(L"gpt|%s|%0*lu|%0*lu|%u\n",
-		uuid,
-		dev->max_size_digits, dev->hdr.first_lba, dev->max_size_digits,dev->hdr.last_lba,
-		dev->hdr.ptable_entries
-	);
-
 	if(dev->part_entries) {
-		// num uuid start end common-attr type type-attr label
-		fprintf(stderr, "num|%-36s|%-*s|%-*s|%-36s|type attributes |cmn|label\n",
-			"partuuid",
-			dev->max_size_digits,"start", dev->max_size_digits,"end", "type"
-		);
-		
+		// free space number could be up to 2 higher than index number
 		uint64_t chkfree = dev->hdr.first_lba;
 		uint32_t freenum = 1;
-		// TODO: print free space
+	
+		// num uuid start end common-attr type type-attr label
+		fprintf(stderr, "p|num|%-*s|%-*s|%-36s|type attributes |cmn|%-36s|partlabel\n",
+			dev->max_size_digits, "start",
+			dev->max_size_digits, "end",
+			"typeuuid",
+			"partuuid"
+		);
+		
 		for(uint32_t i = 0; i < dev->part_entries; i++) {
 			if(dev->sane_parts) {
 				if(!(chkfree >= dev->parts[i].e.start_lba && chkfree <= dev->parts[i].e.end_lba)) {
@@ -820,14 +851,14 @@ void print_devices() {
 }
 
 void write_mbr(gpt_dev* dev) {
-	mbr m = {0};
 	uint16_t cylinder;
 	chs end;
 
-	m.part[0].type = 0xee; // GPT protective
-	m.part[0].start_lba = 1;
-	m.part[0].size_lba = dev->last_lba > UINT32_MAX ? UINT32_MAX : (uint32_t)dev->last_lba;
-	m.part[0].start.ch_sector = 2; // sector == lba % spt + 1, lba is 1.
+	memset(&(dev->m), 0, MBR_SZ);
+	dev->m.part[0].type = 0xee; // GPT protective
+	dev->m.part[0].start_lba = 1;
+	dev->m.part[0].size_lba = dev->last_lba > UINT32_MAX ? UINT32_MAX : (uint32_t)dev->last_lba;
+	dev->m.part[0].start.ch_sector = 2; // sector == lba % spt + 1, lba is 1.
 
 	// https://en.wikipedia.org/wiki/Logical_block_addressing#CHS_conversion
 	// max cylinder in this addressing is 2^10-1. lba can be too large to represent
@@ -841,11 +872,10 @@ void write_mbr(gpt_dev* dev) {
 		end.head = (dev->last_lba / dev->geo.sectors) % dev->geo.heads;
 		end.sector = (dev->last_lba % dev->geo.sectors) + 1;
 	}
-	m.part[0].end = chstom(end);
-	m.signature = 0xaa55;
+	dev->m.part[0].end = chstom(end);
+	dev->m.signature = 0xaa55;
 
-	memcpy(&(dev->m), &m, MBR_SZ);
-	seekwrite(dev->fd, 0, &m, MBR_SZ);
+	seekwrite(dev->fd, 0, &(dev->m), MBR_SZ);
 }
 
 // recalculate crc for header
@@ -861,20 +891,24 @@ void calc_hdr(gpt_hdr* hdr) {
 }
 
 // recalculate ptable crc and return the value
-// TODO: do this in memory now
-uint32_t calc_ptable(gpt_dev* dev, gpt_hdr* hdr) {
+uint32_t calc_ptable(gpt_dev* dev) {
 	uint32_t calc_crc = 0;
-	part_entry part;
+	int p;
 
-	for(int i = 0; i < hdr->ptable_entries; i++) {
-		seekread(dev->fd, (hdr->ptable_lba * dev->lbsz) + (i * hdr->entry_size), &part, PART_SZ);
-		calc_crc = crc32(calc_crc, &part, PART_SZ);
-
-		if(hdr->entry_size > PART_SZ) {
-			calc_crc = crc32_zero(calc_crc, hdr->entry_size- PART_SZ);
+	for(int i = 0; i < dev->hdr.ptable_entries; i++) {
+		for(p = 0; p < dev->part_entries; p++) {
+			if(dev->parts[p].index == i) { break; }
+		}
+		if(p < dev->part_entries) {
+			calc_crc = crc32(calc_crc, &(dev->parts[p].e), PART_SZ);
+		} else {
+			calc_crc = crc32_zero(calc_crc, PART_SZ);
+		}
+		if(dev->hdr.entry_size > PART_SZ) {
+			calc_crc = crc32_zero(calc_crc, dev->hdr.entry_size - PART_SZ);
 		}
 	}
-	hdr->ptable_crc = calc_crc;
+	
 	return calc_crc;
 }
 
@@ -895,7 +929,6 @@ void restore_primary(gpt_dev* dev) {
 	}
 	calc_hdr(&(dev->hdr));
 
-	// TODO: work from memory
 	for(int i = 0; i < dev->alt.ptable_entries; i++) {
 		seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (i * dev->alt.entry_size), &part, PART_SZ);
 		seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (i * dev->hdr.entry_size), &part, PART_SZ);
@@ -903,6 +936,7 @@ void restore_primary(gpt_dev* dev) {
 	seekwrite(dev->fd, 1 * dev->lbsz, &(dev->hdr), HDR_SZ);
 
 	fprintf(stderr, "copied backup table to primary\n");
+	validate_device(dev);
 }
 
 
@@ -923,7 +957,6 @@ void restore_backup(gpt_dev* dev) {
 	}
 	calc_hdr(&(dev->alt));
 
-	// TODO: work from memory
 	for(int i = 0; i < dev->hdr.ptable_entries; i++) {
 		seekread(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (i * dev->hdr.entry_size), &part, PART_SZ);
 		seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (i * dev->alt.entry_size), &part, PART_SZ);
@@ -931,6 +964,7 @@ void restore_backup(gpt_dev* dev) {
 	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
 
 	fprintf(stderr, "copied primary table to backup\n");
+	validate_device(dev);
 }
 
 void write_gpt(gpt_dev* dev) {
@@ -977,10 +1011,10 @@ void write_gpt(gpt_dev* dev) {
 	calc_hdr(&h);
 	memcpy(&(dev->alt), &h, HDR_SZ);
 
-	// TODO: wipe memory ptable
 	seekwrite_zero(dev->fd, h.ptable_lba * dev->lbsz, h.ptable_entries * h.entry_size);
 	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &h, HDR_SZ);
 
+	// includes validation which repopulates memory partition table
 	restore_primary(dev);
 
 	fprintf(stderr, "wrote new GPT header and table\n");
@@ -1003,11 +1037,68 @@ void relabel_gpt(gpt_dev* dev) {
 	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
 }
 
+int guess_free(gpt_dev* dev, uint64_t* start, uint64_t* end) {
+	uint64_t chkfree = dev->hdr.first_lba;
+	uint32_t freenum = 1;
+
+	if(dev->parts != NULL && !dev->sane_parts) { return -1; }
+	
+	for(uint32_t i = 0; dev->parts != NULL && i < dev->part_entries; i++) {
+		if(!(chkfree >= dev->parts[i].e.start_lba && chkfree <= dev->parts[i].e.end_lba)) {
+			if(!*start && !*end) {
+				*start = chkfree;
+				*end = dev->parts[i].e.start_lba - 1;
+				return 0;
+			}
+			if(*start && *start >= chkfree && *start < dev->parts[i].e.start_lba) {
+				*end = dev->parts[i].e.start_lba - 1;
+				return 0;
+			}
+			if(*end && *end >= chkfree && *end < dev->parts[i].e.start_lba) {
+				*start = chkfree;
+				return 0;
+			}
+		}
+		chkfree = dev->parts[i].e.end_lba + 1;
+	}
+	if(chkfree <= dev->hdr.last_lba) {
+		if(!*start && !*end) {
+			*start = chkfree;
+			*end = dev->hdr.last_lba;
+			return 0;
+		}
+		if(*start && *start >= chkfree && *start <= dev->hdr.last_lba) {
+			*end = dev->hdr.last_lba;
+			return 0;
+		}
+		if(*end && *end >= chkfree && *end <= dev->hdr.last_lba) {
+			*start = chkfree;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+// get a part by num in memory if existing
+int find_part(gpt_dev* dev, uint32_t num, mpart** out) {
+	if(dev->parts == NULL || !dev->sane_parts) { return -1; }
+
+	for(uint32_t i = 0; i < dev->part_entries; i++) {
+		if(dev->parts[i].index == num) {
+			*out = &(dev->parts[i]);
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
 void set_entry(gpt_dev* dev, uint32_t num,
 	char* partid, char* start, char* end, char* typeid, char* typeattr, char* cmnattr, char* label) {
-	part_entry part;
-	uint64_t start_lba;
-	uint64_t end_lba;
+	mpart* part;
+	uint64_t start_lba = 0;
+	uint64_t end_lba = 0;
 	
 	ensure_valid(dev);
 	
@@ -1015,56 +1106,52 @@ void set_entry(gpt_dev* dev, uint32_t num,
 	// zero index
 	num = num - 1;
 
-	// try to default start and end based on prev and next entries or just the start and end of the disk
-	if(start == NULL || start[0] == '-') {
-		start_lba = dev->alt.first_lba;
-		if(num >= 1) {
-			seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + ((num-1) * dev->alt.entry_size), &part, PART_SZ);
-			if(not_zero(part.type, 16)) {
-				start_lba = part.end_lba + 1;
-			}
-		}
-	} else {
+	if(start != NULL && start[0] != '-') {
 		start_lba = strtol(start, NULL, 10);
+		if(start_lba < dev->alt.first_lba || start_lba > dev->alt.last_lba ) { fail("invalid start lba"); }
 	}
-	if(end == NULL || end[0] == '-') {
-		end_lba = dev->alt.last_lba;
-		if(num <= dev->alt.ptable_entries-2) {
-			seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + ((num+1) * dev->alt.entry_size), &part, PART_SZ);
-			if(not_zero(part.type, 16)) {
-				end_lba = part.start_lba - 1;
-			}
-		}
-	} else {
+	if(end != NULL && end[0] != '-') {
 		end_lba = strtol(end, NULL, 10);
+		if(end_lba < dev->alt.first_lba || end_lba > dev->alt.last_lba ) {  fail("invalid end lba"); }
 	}
 
-	if(start_lba < dev->alt.first_lba || start_lba > dev->alt.last_lba ) { fail("invalid start lba"); }
-	if(end_lba < dev->alt.first_lba || end_lba > dev->alt.last_lba ) {  fail("invalid end lba"); }
-	seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &part, PART_SZ);
+	if(find_part(dev, num, &part) != 0) {
+		if(start_lba == 0 || end_lba == 0) {
+			if(guess_free(dev, &start_lba, &end_lba) < 0) { fail("could not find an appropriate free range!"); }
+		}
+
+		// create new partition in memory
+		if((dev->parts = realloc(dev->parts, (++dev->part_entries) * sizeof(mpart))) == NULL) { fail("memfail"); }
+		part = &dev->parts[dev->part_entries-1];
+		part->index = num;
+		memset(&(part->e), 0, PART_SZ);
+	}
 	
-	part.start_lba = start_lba;
-	part.end_lba = end_lba;
+	if(start_lba) { part->e.start_lba = start_lba; }
+	if(end_lba) { part->e.end_lba = end_lba; }
+
+	// re-sort and warn if there are still problems
+	check_overlap(dev);
 	
 	// if '+' generate always
 	// if NULL generate only if not existing
 	// if '-' generate only if not existing
 	// if provided use provded
 	if(partid != NULL && partid[0] == '+') {
-		gen_guid4(part.id);
+		gen_guid4(part->e.id);
 	} else if(partid == NULL || partid[0] == '-') {
-		if(!not_zero(part.id, 16)) {
-			gen_guid4(part.id);
+		if(!not_zero(part->e.id, 16)) {
+			gen_guid4(part->e.id);
 		}
 	} else {
-		parse_uuid(partid, part.id);
+		parse_uuid(partid, part->e.id);
 	}
 
 	if(typeid != NULL && typeid[0] != '-') {
-		parse_uuid(typeid, part.type);
-	} else if(!not_zero(part.type, 16)) {
-		// linux-generic type as default. technically this parse is a small but avoidable performance hit. TODO maybe.
-		parse_uuid("0fc63daf-8483-4772-8e79-3d69d8477de4", part.type);
+		parse_uuid(typeid, part->e.type);
+	} else if(!not_zero(part->e.type, 16)) {
+		// linux-generic type as default. technically this parse is an avoidable performance hit. TODO maybe.
+		parse_uuid("0fc63daf-8483-4772-8e79-3d69d8477de4", part->e.type);
 	}
 
 	if(typeattr != NULL) {
@@ -1072,9 +1159,9 @@ void set_entry(gpt_dev* dev, uint32_t num,
 			if(typeattr[i] == 0) { break; }
 			if(typeattr[i] == '-') { continue; }
 			if(typeattr[i] == '+') {
-				setbit(part.attr, (15-i) + 48, !getbit(part.attr, (15-i)));
+				setbit(part->e.attr, (15-i) + 48, !getbit(part->e.attr, (15-i)));
 			} else {
-				setbit(part.attr, (15-i) + 48, typeattr[i] == '1');
+				setbit(part->e.attr, (15-i) + 48, typeattr[i] == '1');
 			}
 		}
 	}
@@ -1083,41 +1170,58 @@ void set_entry(gpt_dev* dev, uint32_t num,
 			if(cmnattr[i] == 0) { break; }
 			if(cmnattr[i] == '-') { continue; }
 			if(cmnattr[i] == '+') {
-				setbit(part.attr, (2-i), !getbit(part.attr, (2-i)));
+				setbit(part->e.attr, (2-i), !getbit(part->e.attr, (2-i)));
 			} else {
-				setbit(part.attr, (2-i), cmnattr[i] == '1');
+				setbit(part->e.attr, (2-i), cmnattr[i] == '1');
 			}
 		}
 	}
 
 	if(label != NULL) {
-		localtoc16(label, part.name, PARTNAME_CHARS);
+		localtoc16(label, part->e.name, PARTNAME_CHARS);
 	}
-
-	// TODO: memory ptable
-	// write to backup first, then the primary
-	seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &part, PART_SZ);
-	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev, &(dev->alt));
+	
+	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev);
 	calc_hdr(&(dev->alt));
 	calc_hdr(&(dev->hdr));
+
+	// write to backup first, then the primary
+	seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &(part->e), PART_SZ);
 	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
-	seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &part, PART_SZ);
+	seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), &(part->e), PART_SZ);
 	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
 
 	fprintf(stderr, "wrote partition entry %u\n", num + 1);
 }
 
 void del_entry(gpt_dev* dev, uint32_t num) {
+	mpart* part;
+
 	ensure_valid(dev);
 
+	// zero index
 	num = num - 1;
 
-	// TODO: memory ptable
-	// write to backup first, then the primary
-	seekwrite_zero(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), PART_SZ);
-	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev, &(dev->alt));
+	if(find_part(dev, num, &part) != 0) {
+		fail("could not find partition!");
+	}
+	if(dev->part_entries - 1 != 0) {
+		// hacky. move partition to the end of the table and remove it
+		part->e.start_lba = UINT64_MAX;
+		qsort(dev->parts, dev->part_entries, sizeof(mpart), cmp_start);
+		if((dev->parts = realloc(dev->parts, (--dev->part_entries) * sizeof(mpart))) == NULL) { fail("memfail"); }
+	} else {
+		dev->part_entries = 0;
+		free(dev->parts);
+		dev->parts = NULL;
+	}
+
+	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev);
 	calc_hdr(&(dev->alt));
 	calc_hdr(&(dev->hdr));
+
+	// write to backup first, then the primary
+	seekwrite_zero(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), PART_SZ);
 	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
 	seekwrite_zero(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (num * dev->hdr.entry_size), PART_SZ);
 	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
@@ -1125,15 +1229,27 @@ void del_entry(gpt_dev* dev, uint32_t num) {
 	fprintf(stderr, "deleted partition entry %u\n", num + 1);
 }
 
-// TODO: do the thing
 void move_entry(gpt_dev* dev, uint32_t a, uint32_t b) {
-	part_entry part;
-
+	mpart* part;
+	
 	ensure_valid(dev);
-	a = a - 1;
-	b = b - 1;
-	//seekread(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (num * dev->alt.entry_size), &part, PART_SZ);
+	a = a - 1; b = b - 1;
+	if(find_part(dev, b, &part) == 0) { fail("B entry exists!"); }
+	if(find_part(dev, a, &part) != 0) { fail("could not find partition!"); }
+	part->index = b;
 
+	dev->alt.ptable_crc = dev->hdr.ptable_crc = calc_ptable(dev);
+	calc_hdr(&(dev->alt));
+	calc_hdr(&(dev->hdr));
+
+	// write backup first, then primary
+	seekwrite(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (b * dev->alt.entry_size), &(part->e), PART_SZ);
+	seekwrite_zero(dev->fd, (dev->alt.ptable_lba * dev->lbsz) + (a * dev->alt.entry_size), PART_SZ);
+	seekwrite(dev->fd, dev->last_lba * dev->lbsz, &(dev->alt), HDR_SZ);
+
+	seekwrite(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (b * dev->hdr.entry_size), &(part->e), PART_SZ);
+	seekwrite_zero(dev->fd, (dev->hdr.ptable_lba * dev->lbsz) + (a * dev->hdr.entry_size), PART_SZ);
+	seekwrite(dev->fd, 1 * dev->lbsz,             &(dev->hdr), HDR_SZ);
 
 	fprintf(stderr, "moved partition entry %u to %u\n", a+1, b+1);
 }
@@ -1169,7 +1285,7 @@ void usage() {
 		"           92<=H<=lbsz. P must be a power of 2 and >=128. The extra space must be zero.\n"
 		"           This option has almost no practical use and is generally not recommended to use.\n"
 		"\n"
-		"-p         Print\n"
+		"-p         Print disk information, the mbr table, and the gpt table.\n"
 		"-b         Build and write a new protective MBR\n"
 		"-g         Build and write new blank GPT table (wipes all partitions!)\n"
 		"-r         Relabel an existing table with -U UUID, or a new random one if not provided.\n"
@@ -1180,8 +1296,7 @@ void usage() {
 		"           Set NUM partition entry fields. Skipped fields use existing, default, or generated values.\n"
 		"           PARTID will be generated if not provided and not existing. A '+' forces generation.\n"
 		"           START and END are in blocks and are both inclusive.\n"
-		"           Defaults will use available space based on previous end and next start entries.\n"
-		"           (If the the table is not sorted, this may be incorrect!)\n"
+		"           Defaults to a free range for a given START or END, or first available.\n"
 		"           TYPEID defaults to 0fc63daf-8483-4772-8e79-3d69d8477de4 (linux-generic).\n"
 		"           Bits in attr fields '-' skip over existing flags. '+' toggles existing flag.\n"
 		"           LABEL defaults to null. LABEL may be any UTF string representable in UTF-16.\n"
@@ -1189,7 +1304,7 @@ void usage() {
 		"-x NUM PARTID START END TYPEID TYPEATTR CMNATTR LABEL\n"
 		"           Alternative set(-s). A '-' can be used to skip all fields but label.\n"
 		"-d NUM     Delete a partition entry (set all its contents to zero).\n"
-		"-m A B     Move a partition entry from number A to number B.\n"
+		"-m A B     Renumber (move) partition A to number B. B should not exist.\n"
 		"\n"
 		, program_name, program_name);
 }
@@ -1380,6 +1495,7 @@ next_printopt:
 					cmd_processed = 1;
 					move_entry(&dev, strtol(argv[1], NULL, 10), strtol(argv[2], NULL, 10));
 					argv += 2;
+					goto next_cmd;
 				default:
 					usage();
 					return 1;
