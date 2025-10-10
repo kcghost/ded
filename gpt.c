@@ -53,6 +53,8 @@ int first_print = 1;
 // longest known type alias "root-loongarch64-verity-sig"
 #define TYPE_DIGITS 27
 
+#define max(a,b) (a>b?a:b)
+#define min(a,b) (a<b?a:b)
 #define getbit(in,bit) ((in >> bit) & 1)
 #define setbit(out,bit,val) out = (out & ~((typeof(out))1 << bit)) | ((typeof(out))(val) << bit)
 
@@ -486,7 +488,8 @@ int validate_header(gpt_hdr* hdr, gpt_dev* dev, uint64_t lba) {
 				dev->part_entries++;
 				if(i > max_index) {
 					max_index = i;
-					dev->max_index_digits = digits(max_index+2); // free space "index" may be up to 2 greater
+					// free space "index" may be up to 2 greater
+					dev->max_index_digits = max(dev->max_index_digits,digits(max_index+2));
 				}
 			} else if(part_index < dev->part_entries) {
 				// second pass on alt record them into memory
@@ -617,6 +620,7 @@ int open_device(char* device, gpt_dev* dev, int rflag)  {
 
 	dev->disk_seq = disk_seq;
 	dev->last_lba = (size_bytes / dev->lbsz) - 1;
+	dev->max_index_digits = max(3,digits(disk_seq));
 	dev->max_size_digits = digits(dev->last_lba);
 
 	// initialize defaults for dev struct
@@ -697,8 +701,8 @@ void print_part(gpt_dev* dev, uint32_t num, part_entry* part) {
 	bitstring(part->attr, 3, cmn_bits);
 
 	// num uuid start end type type-attr common-attr label
-	wprintf(L"p|%03u|%0*lu|%0*lu|%s|%s|%s|%s|%s\n",
-		num,
+	wprintf(L"p|%0*u|%0*lu|%0*lu|%s|%s|%s|%s|%s\n",
+		dev->max_index_digits, num,
 		dev->max_size_digits, part->start_lba,
 		dev->max_size_digits, part->end_lba,
 		type_uuid,
@@ -738,15 +742,16 @@ void print_device(gpt_dev* dev) {
 
 	// num range type attributes identifiers
 	fprintf(stderr,
-		"d|seq|%-*s|%-*s|%-*s|%-*s|lbsz|hpc|spt|cyls |boot crc|unkn|disksign|%-36s|path\n",
+		"d|%-*s|%-*s|%-*s|%-*s|%-*s|lbsz|hpc|spt|cyls |boot crc|unkn|disksign|%-36s|path\n",
+		dev->max_index_digits, "seq",
 		dev->max_size_digits, "fst avl",
 		dev->max_size_digits, "lst avl",
 		dev->max_size_digits, "last lb",
 		dev->is_valid_gpt == VALID_GPT ? digits(dev->hdr.ptable_entries) : 3, "max",
 		"diskuuid"
 	);
-	wprintf(L"d|%03lu|%0*lu|%0*lu|%0*lu|%u|%04u|%03u|%03u|%05u|%08x|%04x|%08x|%s|%s\n",
-		dev->disk_seq,
+	wprintf(L"d|%0*lu|%0*lu|%0*lu|%0*lu|%u|%04u|%03u|%03u|%05u|%08x|%04x|%08x|%s|%s\n",
+		dev->max_index_digits, dev->disk_seq,
 		dev->max_size_digits, dev->is_valid_gpt == VALID_GPT ? dev->hdr.first_lba : 0,
 		dev->max_size_digits, dev->is_valid_gpt == VALID_GPT ? dev->hdr.last_lba : 0,
 		dev->max_size_digits, dev->last_lba,
@@ -776,8 +781,8 @@ void print_device(gpt_dev* dev) {
 			if(dev->m.part[i].type == 0x00) { continue; }
 			start = mtochs(dev->m.part[i].start);
 			end = mtochs(dev->m.part[i].end);
-			wprintf(L"m|%03u|%0*u|%0*u|%03u|%02u|%04u|%03u|%02u|%04u|%02x\n",
-				i + 1,
+			wprintf(L"m|%0*u|%0*u|%0*u|%03u|%02u|%04u|%03u|%02u|%04u|%02x\n",
+				dev->max_index_digits, i + 1,
 				dev->max_size_digits, dev->m.part[i].start_lba,
 				dev->max_size_digits, dev->m.part[i].size_lba,
 				start.head,
@@ -1256,7 +1261,7 @@ void move_entry(gpt_dev* dev, uint32_t a, uint32_t b) {
 
 void usage() {
 	wprintf(L""
-		"%s [-f]\n"
+		"%s [-h]\n"
 		"%s [DEVICE] [COMMANDS]\n"
 		"\n"
 		"Print or modify contents of GPT partition tables.\n"
