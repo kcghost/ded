@@ -3,8 +3,13 @@
 # Their names and ids are generated with `systemd-id128 -u show`
 
 # alias uuid flag-type
-# dps-auto flags: no-auto, read-only, growfs
-# ms-flags 
+# common:    0:required 1:no-block-io 2:legacy
+# dps-auto:  63:no-auto, 60:read-only, 59:grow-file-system
+# ms-flags:  63:no-auto, 62:hidden, 61:shadow-copy, 60:read-only
+# esp-flags: 63:ms-no-auto 1:no-auto
+# esp is owned by the spec and has no type-specific flags. But MS sets bit 63 in its installer anyway.
+# rather than respecting the ms flag systemd-gpt-auto-generator use the no-block-io flag as a hint to not automount esp
+# https://www.freedesktop.org/software/systemd/man/latest/systemd-gpt-auto-generator.html
 
 # system
 # https://www.intel.com/content/dam/doc/product-specification/efi-v1-10-specification.pdf
@@ -16,13 +21,13 @@ bios                        21686148-6449-6e6f-744e-656564454649 # not in DPS
 # https://uapi-group.org/specifications/specs/discoverable_partitions_specification/
 xbootldr                    bc13c2ff-59e6-4262-a352-b275fd6f7172 dps-auto
 
-# microsoft
+# microsoft (not mentioned in DPS)
 # https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-partition_information_gpt
-ms-basic                    ebd0a0a2-b9e5-4433-87c0-68b6b72699c7 ms-flags # not in DPS
-ms-reserved                 e3c9e316-0b5c-4db8-817d-f92df00215ae ms-flags # not in DPS
-ms-ldm-metadata             5808c8aa-7e8f-42e0-85d2-e1e90434cfb3 ms-flags # not in DPS
-ms-ldm-data                 af9b60a0-1431-4f62-bc68-3311714a69ad ms-flags # not in DPS
-ms-recovery                 de94bba4-06d1-4d40-a16a-bfd50179d6ac ms-flags # not in DPS
+ms-basic                    ebd0a0a2-b9e5-4433-87c0-68b6b72699c7 ms-flags
+ms-reserved                 e3c9e316-0b5c-4db8-817d-f92df00215ae ms-flags
+ms-ldm-metadata             5808c8aa-7e8f-42e0-85d2-e1e90434cfb3 ms-flags
+ms-ldm-data                 af9b60a0-1431-4f62-bc68-3311714a69ad ms-flags
+ms-recovery                 de94bba4-06d1-4d40-a16a-bfd50179d6ac ms-flags
 
 # linux
 # https://git.kernel.org/pub/scm/linux/kernel/git/tglx/history.git/commit/?id=a04a1bed8dfe791c922d8ac026df5215f5adc95c
