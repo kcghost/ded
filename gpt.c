@@ -1328,10 +1328,10 @@ int main(int argc, char* argv[]) {
 	char* label;
 	partid = start = end = typeid = typeattr = cmnattr = label = NULL;
 
-	// set locale to system default, so we can print "wide" characters with wprintf (for UTF-16 partition label)
+	// force locale to UTF-8, so we can print "wide" characters with wprintf (for UTF-16 partition label)
 	// Once either printf or wprintf is used the other stops working for that stream
 	// Use wprintf for stdout, regular printf for stderr
-	setlocale(LC_ALL, "");
+	setlocale(LC_CTYPE, "C.UTF-8");
 	
 	if(argv[0] != NULL) {
 		program_name = argv[0];
